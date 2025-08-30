@@ -1,3 +1,5 @@
-# SWDB 2025 AllenSDK Capsule Template 
+# Finding NEMO
 
-Python environment for using AllenSDK to access Visual Coding and Visual Behavior datasets. 
+Novelty dynamics Emerging in Multiple regions Over time
+
+Elle Bakotich, Sophia Becker, Veronica Chelu, Balma Serrano Porcar
