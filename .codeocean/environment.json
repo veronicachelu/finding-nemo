@@ -14,7 +14,8 @@
 					"version": "2.16.2"
 				},
 				{
-					"name": "sklearn"
+					"name": "sklearn",
+					"version": "0.0"
 				}
 			],
 			"options": {},
