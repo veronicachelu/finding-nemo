@@ -1,0 +1,9 @@
+{
+	"version": 1,
+	"attached_datasets": [
+		{
+			"id": "d6805a10-89fc-4b22-a9b3-99ce5a44756b",
+			"mount": "visual-behavior-neuropixels"
+		}
+	]
+}
