@@ -186,3 +186,14 @@ def get_binned_triggered_spike_counts_fast(
         counts[i, :] = np.diff(idx)
 
     return counts
+
+def apply_zscore(rates, axis=1):
+    """
+    Z-score firing rates.
+    Args:
+        rates (numpy.ndarray): Firing rates, shape (n_neurons, n_time_points)
+        axis: Axis of rates across which statics are to be computed, default: 1 (across time points)
+    Returns:
+        rates_zscored (numpy.ndarray): Z-scored firing rates
+    """
+    return (rates - np.nanmean(rates, axis=axis, keepdims=True)) / np.nanstd(rates, axis=axis, keepdims=True)
