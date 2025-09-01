@@ -2,7 +2,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 import matplotlib as mpl
 from sklearn.metrics import confusion_matrix
-from data_utils import process_nwb_metadata, get_stim_window, get_spike_counts_all, get_binned_triggered_spike_counts_fast
+from data_utils import process_nwb_metadata, get_stim_window, get_spike_counts_all, get_binned_triggered_spike_counts_fast, apply_zscore
 
 def create_raster(
     spike_times,
@@ -300,6 +300,7 @@ def plot_multi_area_psth_and_raster(
     time_before_change=1.0,
     duration=2.5,
     bin_size=0.01,
+    zscore_pop=[],
     cmap='viridis',
     clim_percentiles=(0.1, 99.9),
     figsize_per_row=(12, 3.6),
@@ -344,6 +345,12 @@ def plot_multi_area_psth_and_raster(
             rates = trial_counts.mean(axis=0) / bin_size  # Hz
             psths.append(rates)
         pop_rates = np.asarray(psths)  # (units, bins-1)
+        
+        # ---------- if specified, z-score individual unit firing rates ----------
+        plt_rate_label = 'Firing rate (Hz)'
+        if name in zscore_pop:
+            pop_rates = apply_zscore(rates=pop_rates, axis=1)
+            plt_rate_label = 'Z-scored firing rate (Hz)'
 
         # ---------- panels ----------
         ax_hm, ax_mean, ax_ras = axs[r, 0], axs[r, 1], axs[r, 2]
@@ -360,14 +367,14 @@ def plot_multi_area_psth_and_raster(
         ax_hm.axvline(event_col, color='r', linestyle='--', lw=1)
         ax_hm.set_title(f'{name} population', loc='left', fontsize=10)
         cb = fig.colorbar(im, ax=ax_hm, fraction=0.046, pad=0.04)
-        cb.set_label('Firing rate (Hz)')
+        cb.set_label(plt_rate_label)
 
         # Mean PSTH
         ax_mean.plot(bins[:-1] - time_before_change, pop_rates.mean(axis=0), color='k',
                      label=f'{name} (n={pop_rates.shape[0]})')
         ax_mean.axvline(0, ls='--', color='r', lw=1)
         ax_mean.set_xlabel('Time from event (s)')
-        ax_mean.set_ylabel('Firing rate (Hz)')
+        ax_mean.set_ylabel(plt_rate_label)
         ax_mean.legend(frameon=False, fontsize=9)
         ax_mean.set_title('Mean PSTH', fontsize=10)
 
