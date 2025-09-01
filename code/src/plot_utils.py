@@ -370,7 +370,7 @@ def plot_multi_area_psth_and_raster(
         cb.set_label(plt_rate_label)
 
         # Mean PSTH
-        ax_mean.plot(bins[:-1] - time_before_change, pop_rates.mean(axis=0), color='k',
+        ax_mean.plot(bins[:-1] - time_before_change, np.nanmean(pop_rates, axis=0), color='k',
                      label=f'{name} (n={pop_rates.shape[0]})')
         ax_mean.axvline(0, ls='--', color='r', lw=1)
         ax_mean.set_xlabel('Time from event (s)')

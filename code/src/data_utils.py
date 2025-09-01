@@ -197,3 +197,34 @@ def apply_zscore(rates, axis=1):
         rates_zscored (numpy.ndarray): Z-scored firing rates
     """
     return (rates - np.nanmean(rates, axis=axis, keepdims=True)) / np.nanstd(rates, axis=axis, keepdims=True)
+
+
+def get_multi_area_firing_rates(area_packets,event_times,time_before_change=1.0,duration=2.5,bin_size=0.01):
+    """
+    Compute firing rates.
+    Args:
+        rates (numpy.ndarray): Firing rates, shape (n_neurons, n_time_points)
+        axis: Axis of rates across which statics are to be computed, default: 1 (across time points)
+    Returns:
+        rates_zscored (numpy.ndarray): Z-scored firing rates
+    """
+    
+    bins = np.arange(0, duration + bin_size, bin_size)
+    
+    results = []
+    for r, pkt in enumerate(area_packets):
+        name       = pkt['name']
+        spikes_all = pkt['spikes']
+        ridx       = int(np.clip(pkt.get('raster_idx', 0), 0, max(0, len(spikes_all)-1)))
+
+        start_times = event_times - time_before_change  # align so x=0 is the event
+        psths = []
+        for st in spikes_all:
+            trial_counts = get_binned_triggered_spike_counts_fast(st, start_times, bins)  # (trials, bins-1)
+            rates = trial_counts.mean(axis=0) / bin_size  # Hz
+            psths.append(rates)
+        pop_rates = np.asarray(psths)  # (units, bins-1)
+    
+        results.append({'area': name, 'pop_rates': pop_rates, 'bins': bins-time_before_change})
+    
+    return results
