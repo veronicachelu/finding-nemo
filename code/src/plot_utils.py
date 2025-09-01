@@ -2,7 +2,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 import matplotlib as mpl
 from sklearn.metrics import confusion_matrix
-from data_utils import process_nwb_metadata, get_stim_window, get_spike_counts_all, get_binned_triggered_spike_counts_fast, apply_zscore
+from data_utils import process_nwb_metadata, get_stim_window, get_spike_counts_all, get_binned_triggered_spike_counts_fast, apply_zscore 
 
 def create_raster(
     spike_times,
@@ -434,9 +434,6 @@ def plot_covariance_matrix(cov, ax, title='Covariance Matrix',
     return im
 
 
-import numpy as np
-import matplotlib.pyplot as plt
-
 # ---------- helpers ----------
 def compute_unit_covariance(pop_rates, normalize='zscore'):
     """
@@ -656,3 +653,93 @@ def plot_area_covariances_with_eigs(
     fig.tight_layout()
     fig.subplots_adjust(hspace=hspace)
     return fig, axs, results
+
+
+def _familiarity_colors(presentations):
+    df = presentations.copy()
+    if 'active' in df:   df = df[df['active']]
+    if 'omitted' in df:  df = df[~df['omitted']]
+    if 'image_name' not in df:
+        raise ValueError("presentations must include 'image_name'")
+    return df.groupby('image_name').cumcount().values  # times seen before
+
+def _trial_rates(spikes_all, event_times, pre, duration, bin_size, post_window=(0.0, 0.5)):
+    """Return (units x trials) mean rate in post_window after each event."""
+    bins = np.arange(0, duration + bin_size, bin_size)
+    start_times = event_times - pre
+    B = len(bins) - 1
+    centers = (bins[:-1] + bins[1:]) * 0.5
+    keep = (centers >= post_window[0]) & (centers < post_window[1])
+
+    rates_ut = []
+    for st in spikes_all:
+        counts = get_binned_triggered_spike_counts_fast(st, start_times, bins)  # (trials, B)
+        rates  = counts / bin_size                                           # Hz
+        rates_ut.append(rates[:, keep].mean(axis=1))                         # (trials,)
+    return np.asarray(rates_ut)  # (units, trials)
+
+def plot_simple_trial_pca(
+    area_spikes,                 # list of 1D spike-time arrays for ONE area
+    event_times,                 # 1D array
+    presentations=None,          # DataFrame if coloring by familiarity/orientation
+    color_mode='familiarity',    # 'familiarity' | 'orientation' | None
+    pre=1.0, duration=2.5, bin_size=0.01,
+    post_window=(0.0, 0.5),
+    s=14, alpha=0.9, cmap='viridis'
+):
+    """
+    Builds (units x trials) post-event rates, z-scores per unit, PCA, then scatter PC1 vs PC2.
+    Returns (proj_2d, explained, colors_used).
+    """
+    event_times = np.asarray(event_times)
+    Z0 = _trial_rates(area_spikes, event_times, pre, duration, bin_size, post_window)  # (units x trials)
+
+    # z-score across trials per unit
+    mu = Z0.mean(axis=1, keepdims=True)
+    sd = Z0.std(axis=1, keepdims=True) + 1e-9
+    Z = (Z0 - mu) / sd
+
+    # PCA via covariance across units (stable, matches your earlier projection)
+    C = np.cov(Z)                               # (units x units)
+    eigvals, eigvecs = np.linalg.eig(C)         # eigvecs: units x comps
+    order = np.argsort(eigvals)[::-1]
+    eigvals = np.real(eigvals[order])
+    eigvecs = np.real(eigvecs[:, order])
+
+    proj = eigvecs[:, :2].T @ Z                # (2 x trials)
+    explained = eigvals[:2] / eigvals.sum()
+
+    # colors
+    colors = None
+    clabel = None
+    if color_mode and presentations is not None:
+        df = presentations.copy()
+        if 'active' in df:   df = df[df['active']]
+        if 'omitted' in df:  df = df[~df['omitted']]
+        if color_mode == 'familiarity':
+            colors = _familiarity_colors(df)
+            clabel = 'Familiarization (seen before)'
+        elif color_mode == 'orientation':
+            if 'orientation' not in df:
+                raise ValueError("presentations must include 'orientation' for color_mode='orientation'")
+            colors = df['orientation'].astype(float).values
+            clabel = 'Orientation'
+        # simple length guard
+        m = min(proj.shape[1], len(colors))
+        x, y = proj[0, :m], proj[1, :m]
+        c = colors[:m]
+    else:
+        x, y = proj[0], proj[1]
+        c = None
+
+    # plot
+    fig, ax = plt.subplots(1, 1, figsize=(5.5, 4.5))
+    sc = ax.scatter(x, y, s=s, alpha=alpha, c=c, cmap=cmap) if c is not None else ax.scatter(x, y, s=s, alpha=alpha)
+    ax.set_title(f'PC1 vs PC2 — {100*explained.sum():.1f}% var (PC1 {100*explained[0]:.1f}%, PC2 {100*explained[1]:.1f}%)')
+    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+    if c is not None:
+        cb = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cb.set_label(clabel)
+    fig.tight_layout()
+
+    return proj, explained, (colors if c is not None else None)
