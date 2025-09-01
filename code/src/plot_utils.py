@@ -54,10 +54,7 @@ def create_psth(
     a, _ = np.histogram(spike_times, bins=bins)
 
     # Divide by # of trials, then bin size to get a rate estimate in Spikes/Sec = Hz
-    # a = a/np.max(stim_index)/bin_size
-    n_trials = int(rtrials.max() + 1) if 'rtrials' in locals() else 1  # or pass in n_trials
-    a = a / max(1, n_trials) / bin_size
-
+    a = a/np.max(stim_index)/bin_size
     ax.plot(bin_centers, a, c=color, label=label)
     ax.set_xlabel('Time from stimulus (seconds)')
     ax.set_ylabel('Spike Rate (Hz)')
@@ -308,7 +305,7 @@ def plot_multi_area_psth_and_raster(
 ):
     """
     Stack multiple areas as rows: [Heatmap | Mean PSTH | Raster].
-    Reuses your fast binning + raster helpers:
+    Reuses fast binning + raster helpers:
       - get_binned_triggered_spike_counts_fast
       - get_stim_window / create_raster
 
@@ -327,6 +324,7 @@ def plot_multi_area_psth_and_raster(
         gridspec_kw={'width_ratios': [2.0, 1.2, 1.2]},
         squeeze=False, sharex=False, sharey=False
     )
+    
 
     results = []
     # event column index for heatmap (time=0 => bin ~ time_before_change)
@@ -337,7 +335,7 @@ def plot_multi_area_psth_and_raster(
         spikes_all = pkt['spikes']
         ridx       = int(np.clip(pkt.get('raster_idx', 0), 0, max(0, len(spikes_all)-1)))
 
-        # ---------- population PSTH using your fast trial binning ----------
+        # ---------- population PSTH using trial binning ----------
         start_times = event_times - time_before_change  # align so x=0 is the event
         psths = []
         for st in spikes_all:
@@ -378,7 +376,7 @@ def plot_multi_area_psth_and_raster(
         ax_mean.legend(frameon=False, fontsize=9)
         ax_mean.set_title('Mean PSTH', fontsize=10)
 
-        # Raster (reuse your helpers)
+        # Raster (reuse helper)
         t_pre, t_post = time_before_change, duration - time_before_change
         rtimes, rtrials = get_stim_window(spikes_all[ridx], event_times,
                                           pre_window=t_pre, post_window=t_post)
@@ -388,11 +386,273 @@ def plot_multi_area_psth_and_raster(
 
         results.append({'area': name, 'pop_rates': pop_rates, 'bins': bins})
 
-        # cleaner y labels on middle/right columns for lower rows
-        if r > 0:
-            ax_mean.set_ylabel('')
-            ax_ras.set_ylabel('')
-
     fig.tight_layout()
     fig.subplots_adjust(hspace=hspace)  # extra vertical space for row titles
+    return fig, axs, results
+
+
+def _normalize_rates(X, method='zscore', axis=1, eps=1e-9):
+    """
+    Normalize firing-rate matrix X (units x time) along `axis`.
+    method: 'zscore' | 'minmax' | 'none'
+    """
+    if method == 'none':
+        return X
+    X = np.asarray(X, float)
+    if method == 'zscore':
+        mu = X.mean(axis=axis, keepdims=True)
+        sd = X.std(axis=axis, keepdims=True) + eps
+        return (X - mu) / sd
+    elif method == 'minmax':
+        mn = X.min(axis=axis, keepdims=True)
+        mx = X.max(axis=axis, keepdims=True)
+        return (X - mn) / (mx - mn + eps)
+    else:
+        raise ValueError(f"unknown method: {method}")
+
+def compute_unit_covariance(pop_rates, normalize='zscore'):
+    """
+    pop_rates: (n_units, n_bins) firing rates (Hz)
+    Returns: (n_units, n_units) covariance matrix across time.
+    """
+    X = _normalize_rates(pop_rates, method=normalize, axis=1)
+    # np.cov expects variables as rows (units) and observations as columns (time)
+    # pop_rates is (units x time) already, so rowvar=True by default.
+    return np.cov(X)
+
+def plot_covariance_matrix(cov, ax, title='Covariance Matrix',
+                           cmap='magma', clim_percentiles=(1, 99)):
+    """
+    cov: (n_units, n_units) matrix
+    """
+    vmin, vmax = np.percentile(cov, clim_percentiles)
+    im = ax.imshow(cov, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel('Unit'); ax.set_ylabel('Unit')
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Cov')
+    return im
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ---------- helpers ----------
+def compute_unit_covariance(pop_rates, normalize='zscore'):
+    """
+    pop_rates: (units, timebins)
+    normalize: None | 'zscore' | 'center' | 'l2'
+    returns: (units, units) covariance
+    """
+    X = np.asarray(pop_rates)
+    if normalize == 'zscore':
+        mu = X.mean(axis=1, keepdims=True)
+        sd = X.std(axis=1, keepdims=True) + 1e-9
+        X = (X - mu) / sd
+    elif normalize == 'center':
+        X = X - X.mean(axis=1, keepdims=True)
+    elif normalize == 'l2':
+        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+    elif normalize is not None:
+        raise ValueError(f"Unknown normalize '{normalize}'")
+    return np.cov(X)
+
+
+
+def compute_unit_covariance(pop_rates, normalize='zscore'):
+    """
+    pop_rates: (units, timebins) mean trial-binned firing rates per unit.
+    normalize: None | 'zscore' | 'center' | 'l2'
+    returns: (units, units) covariance
+    """
+    X = np.asarray(pop_rates)
+    if X.ndim != 2:
+        raise ValueError("pop_rates must be 2D (units x timebins)")
+    if normalize == 'zscore':
+        mu = X.mean(axis=1, keepdims=True)
+        sd = X.std(axis=1, keepdims=True) + 1e-9
+        X = (X - mu) / sd
+    elif normalize == 'center':
+        X = X - X.mean(axis=1, keepdims=True)
+    elif normalize == 'l2':
+        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+    elif normalize is not None:
+        raise ValueError(f"Unknown normalize '{normalize}'")
+    return np.cov(X)
+
+
+# ---- main: build pop_rates from spikes+events, then plot covariances ----
+def plot_area_covariances(
+    area_packets,
+    event_times,
+    time_before_change=1.0,
+    duration=2.5,
+    bin_size=0.01,
+    normalize='zscore',
+    cmap='viridis',
+    figsize_per_row=(4.8, 3.6),
+    hspace=0.6,
+    share_colorbar=False
+):
+    """
+    Build pop_rates from (spikes, event_times) and plot a covariance per area.
+
+    Parameters
+    ----------
+    area_packets : list of dicts
+        Each dict at least: {'name': str, 'spikes': list_of_1D_arrays_per_unit}
+        e.g., spikes[i] are spike times (seconds, absolute) for unit i.
+    event_times : 1D array of event onsets (seconds, absolute).
+    time_before_change : float
+        Seconds before event to include (pre-window). Alignment origin = event.
+    duration : float
+        Total window length (pre + post). Post = duration - time_before_change.
+    bin_size : float
+        Width of bins for PSTH-style trial binning.
+    normalize : str or None
+        Passed to compute_unit_covariance.
+    cmap : str
+        Matplotlib colormap name.
+    share_colorbar : bool
+        If True, use a global vmin/vmax across areas for comparability.
+
+    Returns
+    -------
+    fig, axs, results
+        results[i] = {
+            'area': name,
+            'pop_rates': (units x bins-1),
+            'cov': (units x units),
+            'bins': bins
+        }
+    """
+    area_packets = list(area_packets)
+    if len(area_packets) == 0:
+        raise ValueError("area_packets is empty.")
+    event_times = np.asarray(event_times)
+    if event_times.ndim != 1 or event_times.size == 0:
+        raise ValueError("event_times must be a non-empty 1D array.")
+
+    # Bin edges for [0, duration]; align by shifting starts to (event - pre)
+    bins = np.arange(0, duration + bin_size, bin_size)  # length B
+    start_times = event_times - time_before_change       # trials
+
+    # Build pop_rates per area using your fast helper
+    results = []
+    for pkt in area_packets:
+        name = pkt.get('name', 'Area')
+        spikes_all = pkt['spikes']  # list of 1D arrays (seconds)
+
+        psths = []
+        for st in spikes_all:
+            # (trials, B-1) counts in each bin for each trial, aligned to event
+            trial_counts = get_binned_triggered_spike_counts_fast(st, start_times, bins)
+            rates = trial_counts.mean(axis=0) / bin_size  # Hz (units per bin / s)
+            psths.append(rates)
+        pop_rates = np.asarray(psths)  # (units, B-1)
+
+        cov = compute_unit_covariance(pop_rates, normalize=normalize)
+        results.append({'area': name, 'pop_rates': pop_rates, 'cov': cov, 'bins': bins})
+
+    # Optional shared color scale
+    if share_colorbar:
+        all_cov_vals = np.concatenate([r['cov'].ravel() for r in results])
+        vmin, vmax = np.percentile(all_cov_vals, [1, 99])  # robust scale
+    else:
+        vmin = vmax = None
+
+    # Plot one covariance per area (stacked)
+    n = len(results)
+    fig, axs = plt.subplots(n, 1,
+                            figsize=(figsize_per_row[0], figsize_per_row[1]*n),
+                            squeeze=False)
+
+    for i, res in enumerate(results):
+        ax = axs[i, 0]
+        cov = res['cov']
+        im = ax.imshow(cov, aspect='auto', cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_title(f"{res['area']} — unit covariance ({normalize})", fontsize=10)
+        ax.set_xlabel('Unit'); ax.set_ylabel('Unit')
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cb.set_label('Covariance')
+
+    fig.tight_layout()
+    fig.subplots_adjust(hspace=hspace)
+    return fig, axs, results
+
+
+
+def plot_area_covariances_with_eigs(
+    area_packets,
+    event_times,
+    time_before_change=1.0,
+    duration=2.5,
+    bin_size=0.01,
+    normalize='zscore',
+    cmap='magma',
+    figsize_per_row=(15, 3.6),
+    hspace=0.8,
+    share_colorbar=False
+):
+    """
+    For each area: [Covariance heatmap | Eigenvalue spectrum].
+    """
+    bins = np.arange(0, duration + bin_size, bin_size)
+    start_times = event_times - time_before_change
+
+    results = []
+    for pkt in area_packets:
+        name = pkt.get('name', 'Area')
+        spikes_all = pkt['spikes']
+
+        psths = []
+        for st in spikes_all:
+            trial_counts = get_binned_triggered_spike_counts_fast(st, start_times, bins)
+            rates = trial_counts.mean(axis=0) / bin_size
+            psths.append(rates)
+        pop_rates = np.asarray(psths)
+
+        cov = compute_unit_covariance(pop_rates, normalize=normalize)
+        λ, eigvecs = np.linalg.eig(cov)
+
+        results.append({'area': name, 'pop_rates': pop_rates,
+                        'cov': cov, 'eigvals': λ, 'eigvecs': eigvecs})
+
+    # shared color scale
+    if share_colorbar:
+        all_cov_vals = np.concatenate([r['cov'].ravel() for r in results])
+        vmin, vmax = np.percentile(all_cov_vals, [1, 99])
+    else:
+        vmin = vmax = None
+
+    # make figure
+    n = len(results)
+    fig, axs = plt.subplots(n, 3,
+                            figsize=(figsize_per_row[0], figsize_per_row[1]*n),
+                            squeeze=False)
+
+    for i, res in enumerate(results):
+        # Covariance heatmap
+        ax_cov = axs[i, 0]
+        im = ax_cov.imshow(res['cov'], aspect='auto', cmap=cmap, vmin=vmin, vmax=vmax)
+        ax_cov.set_title(f"{res['area']} — covariance", fontsize=10)
+        ax_cov.set_xlabel('Unit'); ax_cov.set_ylabel('Unit')
+        cb = fig.colorbar(im, ax=ax_cov, fraction=0.046, pad=0.04)
+        cb.set_label('Covariance')
+
+        # Eigenvalue spectrum
+        ax_eig = axs[i, 1]
+        ax_eig.plot(res['eigvals'], marker='o', color='k')
+        ax_eig.set_title(f"{res['area']} — eigenvalue spectrum", fontsize=10)
+        ax_eig.set_xlabel('Eigenvector index')
+        ax_eig.set_ylabel('Variance explained (λ)')
+        
+        ax_vec = axs[i, 2]
+        ax_vec.plot(res['eigvecs'][:, 0], marker='o')
+        ax_vec.set_title(f"{res['area']} — first eigenvector", fontsize=10)
+        ax_vec.set_xlabel('Unit')
+        ax_vec.set_ylabel('Coefficient')
+
+    fig.tight_layout()
+    fig.subplots_adjust(hspace=hspace)
     return fig, axs, results
