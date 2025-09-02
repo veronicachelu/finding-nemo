@@ -151,3 +151,6 @@ dmypy.json
 !.vscode/launch.json
 !.vscode/extensions.json
 !.vscode/*.code-snippets
+.vscode
+
+.codeocean/environment.json
