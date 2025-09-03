@@ -2,6 +2,13 @@
 import numpy as np
 import pandas as pd
 import pynwb
+from matplotlib import pyplot as plt
+# autocorrelogram imports
+from neo.core import SpikeTrain
+from quantities import ms, s, Hz
+from elephant.statistics import time_histogram, instantaneous_rate,  mean_firing_rate
+from elephant.conversion import BinnedSpikeTrain
+from elephant.spike_train_correlation import cross_correlation_histogram
 
 # Set the data root according to OS
 import platform
@@ -228,3 +235,156 @@ def get_multi_area_firing_rates(area_packets,event_times,time_before_change=1.0,
         results.append({'area': name, 'pop_rates': pop_rates, 'bins': bins-time_before_change})
     
     return results
+
+
+def build_trials_by(df, key_col, start_col="start_time", na_fill=None):
+    t = df.loc[:, [start_col, key_col]].copy()
+    if na_fill is not None:
+        t[key_col] = t[key_col].fillna(na_fill)
+    t = (t.rename(columns={key_col: "key"})
+           .sort_values(["key", start_col], kind="mergesort")
+           .reset_index(drop=True))
+
+    codes, uniques = pd.factorize(t["key"])
+    cmap = plt.get_cmap("tab10" if len(uniques) <= 10 else "tab20")
+    color_map = {u: cmap(i % cmap.N) for i, u in enumerate(uniques)}
+    trial_colors = t["key"].map(color_map).values
+
+    k = t["key"].to_numpy()
+    change_rows = np.flatnonzero(k[1:] != k[:-1]) + 1
+    block_starts = np.r_[0, change_rows]
+    block_ends = np.r_[change_rows, len(t)]
+    block_mids = (block_starts + block_ends) / 2
+    block_names = t["key"].iloc[block_starts].to_numpy()
+
+    return t, trial_colors, change_rows, block_mids, block_names
+
+def make_psth(spikes, start_times, window_dur, bin_size=0.001):
+    # bins are absolute relative to each event (0..window)
+    bins = np.arange(0, window_dur + bin_size, bin_size)
+    # trial x bin counts
+    trial_counts = get_binned_triggered_spike_counts_fast(spikes, start_times, bins)
+    # average over trials, convert to Hz
+    rates = trial_counts.mean(axis=0) / bin_size
+    return rates, bins
+
+def compute_population_psth(spike_times_by_unit, start_times, window_dur, bin_size=0.01):
+    """
+    Compute PSTHs for a population of units.
+    Args:
+        spike_times_by_unit (list of 1D arrays): spike times for each unit.
+        start_times (1D array): event onset times.
+        window_dur (float): seconds.
+        bin_size (float): seconds.
+    Returns:
+        pop_rates (2D array): shape (n_units, n_bins).
+        bins (1D array): bin edges (0..window_dur).
+    """
+    psths = []
+    bins_ref = None
+    for spikes in spike_times_by_unit:
+        rates, bins = make_psth(spikes, start_times, window_dur, bin_size)
+        psths.append(rates)
+        bins_ref = bins if bins_ref is None else bins_ref
+    return np.asarray(psths), bins_ref
+
+def align_spikes_to_events(spikes, event_times, t_pre, t_post):
+    """
+    Align spikes to each event within [ -t_pre, +t_post ].
+    Args:
+        spikes (1D array): sorted spike times.
+        event_times (1D array): event onsets.
+        t_pre (float): seconds before event (positive).
+        t_post (float): seconds after event (positive).
+    Returns:
+        aligned (list of 1D arrays): for each event, spike times relative to event.
+    """
+    aligned = []
+    for t0 in event_times:
+        start = t0 - t_pre
+        stop  = t0 + t_post
+        i0 = np.searchsorted(spikes, start)
+        i1 = np.searchsorted(spikes, stop)
+        aligned.append(spikes[i0:i1] - t0)
+    return aligned
+
+
+def build_area_packet(area_name, good_units_df, spike_times_all_units,
+                      area_col='structure_acronym', sort_key=None, raster_unit_idx=0):
+    area_units = good_units_df[good_units_df[area_col] == area_name]
+    spike_times_by_unit = [spike_times_all_units[iu] for iu, _ in area_units.iterrows()]
+    if sort_key is not None and sort_key in area_units.columns:
+        order = np.argsort(area_units[sort_key].values)
+        spike_times_by_unit = [spike_times_by_unit[i] for i in order]
+    return dict(name=area_name, spikes=spike_times_by_unit, raster_idx=raster_unit_idx)
+
+
+def _normalize_rates(X, method='zscore', axis=1, eps=1e-9):
+    """
+    Normalize firing-rate matrix X (units x time) along `axis`.
+    method: 'zscore' | 'minmax' | 'none'
+    """
+    if method == 'none':
+        return X
+    X = np.asarray(X, float)
+    if method == 'zscore':
+        mu = X.mean(axis=axis, keepdims=True)
+        sd = X.std(axis=axis, keepdims=True) + eps
+        return (X - mu) / sd
+    elif method == 'minmax':
+        mn = X.min(axis=axis, keepdims=True)
+        mx = X.max(axis=axis, keepdims=True)
+        return (X - mn) / (mx - mn + eps)
+    else:
+        raise ValueError(f"unknown method: {method}")
+
+def compute_unit_covariance(pop_rates, normalize='zscore'):
+    """
+    pop_rates: (n_units, n_bins) firing rates (Hz)
+    Returns: (n_units, n_units) covariance matrix across time.
+    """
+    X = _normalize_rates(pop_rates, method=normalize, axis=1)
+    # np.cov expects variables as rows (units) and observations as columns (time)
+    # pop_rates is (units x time) already, so rowvar=True by default.
+    return np.cov(X)
+
+
+def compute_unit_covariance(pop_rates, normalize='zscore'):
+    """
+    pop_rates: (units, timebins) mean trial-binned firing rates per unit.
+    normalize: None | 'zscore' | 'center' | 'l2'
+    returns: (units, units) covariance
+    """
+    X = np.asarray(pop_rates)
+    if X.ndim != 2:
+        raise ValueError("pop_rates must be 2D (units x timebins)")
+    if normalize == 'zscore':
+        mu = X.mean(axis=1, keepdims=True)
+        sd = X.std(axis=1, keepdims=True) + 1e-9
+        X = (X - mu) / sd
+    elif normalize == 'center':
+        X = X - X.mean(axis=1, keepdims=True)
+    elif normalize == 'l2':
+        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+    elif normalize is not None:
+        raise ValueError(f"Unknown normalize '{normalize}'")
+    return np.cov(X)
+
+def make_group(df, key_col, *, label=None, start_col="start_time", t_pre=1., t_post=2.0, bin_size=0.1,
+        smooth_kind="gaussian", smooth_value=0.5, na_fill=None, transform=None):
+    gdf = df.copy()
+    if transform is not None:
+        gdf = transform(gdf)
+    trials, colors, sep, mids, names = build_trials_by(gdf, key_col, start_col=start_col, na_fill=na_fill)
+    return dict(trials=trials, colors=colors, sep=sep, mids=mids, names=names, label=(label or key_col), start_col=start_col,
+                t_pre=t_pre, t_post=t_post, bin_size=bin_size, smooth_kind=smooth_kind, smooth_value=smooth_value)
+
+
+def generate_autocorr_data(spiketrain, bin_ms, win_ms):
+    win_bins = int(round(win_ms / bin_ms))
+    bst = BinnedSpikeTrain([spiketrain], bin_size=bin_ms * ms)
+    ac_sig, lag_bins = cross_correlation_histogram(bst, bst, window=[-win_bins, win_bins])
+    ac = ac_sig.magnitude.flatten()
+    lags = np.asarray(lag_bins, dtype=int)
+    keep = lags != 0
+    return lags[keep] * bin_ms, ac[keep]
