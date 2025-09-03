@@ -63,7 +63,7 @@ def get_performance_summary(rolling_performance, reward_threshold=2,verbose=Fals
     return performance_summary
 
 
-def get_performance_summary_all_sessions(ecephys_session_table,verbose=False):
+def get_performance_summary_all_sessions(cache, ecephys_session_table, reward_threshold=2, verbose=False):
     
     all_session_performance_summary = []
     for ii, session_id in enumerate(ecephys_session_table.behavior_session_id.values):
@@ -75,15 +75,44 @@ def get_performance_summary_all_sessions(ecephys_session_table,verbose=False):
 
         # Extract performance summary
         rolling_performance = session.get_rolling_performance_df()
-        performance_summary = get_performance_summary(rolling_performance, reward_threshold=2, verbose=verbose)
+        performance_summary = get_performance_summary(rolling_performance, reward_threshold=reward_threshold, verbose=verbose)
         performance_summary['behavior_session_id'] = session_id
 
         all_session_performance_summary.append(performance_summary)
     
     return all_session_performance_summary
 
-def filter_behavior_sessions_performance():
-    raise NotImplementedError
 
-def extract_relevant_sessions():
-    raise NotImplementedError
+## Filter sessions based on performance metrics ##
+def filter_valid_sessions(ecephys_session_table, thresh_perc_engaged = 0.6, thresh_dur_engaged = 0.6, verbose=False):
+    # thresh_perc_engaged: only sessions that have more than thresh_perc_engaged during engagement period are included in analysis [y-axis, stats 1]
+    # thresh_dur_engaged: only sessions that are engaged for longer than thresh_dur_engaged are included in analysis [x-axis, stat 2]
+
+    ecephys_session_table['perc_last_disengagement'] = ecephys_session_table['trial_last_disengagement'] / ecephys_session_table['trial_number']
+
+    valid_sessions = ecephys_session_table.loc[(ecephys_session_table.perc_engaged_strict > thresh_perc_engaged) \
+                                                    & (ecephys_session_table.perc_last_disengagement > thresh_dur_engaged)]
+    valid_session_ids = list(valid_sessions['behavior_session_id'].values)
+
+    if verbose:
+        print(f'Valid sessions ({len(valid_session_ids)})\n')
+        print(valid_session_ids)
+
+    return valid_sessions, valid_session_ids, ecephys_session_table
+
+
+def extract_relevant_sessions(cache, valid_session_ids, verbose=False):
+    all_sessions = []
+    list_error = []
+    for ii, session_id in enumerate(valid_session_ids):
+        if verbose: 
+            print(f'Start loading session {ii}/{len(valid_session_ids)}.')
+        try:
+            session = cache.get_behavior_session(session_id)
+        except:
+            list_error.append(session_id)
+            continue
+
+    df_all_sessions = pd.concat(all_sessions)
+            
+    return df_all_sessions, list_error
