@@ -1,8 +1,14 @@
 import numpy as np
 from matplotlib import pyplot as plt
 import matplotlib as mpl
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix
-from data_utils import process_nwb_metadata, get_stim_window, get_spike_counts_all, get_binned_triggered_spike_counts_fast, apply_zscore
+from matplotlib.collections import LineCollection 
+import data_utils
+import importlib
+importlib.reload(data_utils)
+from data_utils import *
 
 def create_raster(
     spike_times,
@@ -77,59 +83,6 @@ def create_confusion_matrix(
     cbar = plt.colorbar(im)
     cbar.set_label('Fraction Guessed')
     
-def make_psth(spikes, start_times, window_dur, bin_size=0.001):
-    # bins are absolute relative to each event (0..window)
-    bins = np.arange(0, window_dur + bin_size, bin_size)
-    # trial x bin counts
-    trial_counts = get_binned_triggered_spike_counts_fast(spikes, start_times, bins)
-    # average over trials, convert to Hz
-    rates = trial_counts.mean(axis=0) / bin_size
-    return rates, bins
-
-
-def compute_population_psth(spike_times_by_unit, start_times, window_dur, bin_size=0.01):
-    """
-    Compute PSTHs for a population of units.
-    Args:
-        spike_times_by_unit (list of 1D arrays): spike times for each unit.
-        start_times (1D array): event onset times.
-        window_dur (float): seconds.
-        bin_size (float): seconds.
-    Returns:
-        pop_rates (2D array): shape (n_units, n_bins).
-        bins (1D array): bin edges (0..window_dur).
-    """
-    psths = []
-    bins_ref = None
-    for spikes in spike_times_by_unit:
-        rates, bins = make_psth(spikes, start_times, window_dur, bin_size)
-        psths.append(rates)
-        bins_ref = bins if bins_ref is None else bins_ref
-    return np.asarray(psths), bins_ref
-
-
-def align_spikes_to_events(spikes, event_times, t_pre, t_post):
-    """
-    Align spikes to each event within [ -t_pre, +t_post ].
-    Args:
-        spikes (1D array): sorted spike times.
-        event_times (1D array): event onsets.
-        t_pre (float): seconds before event (positive).
-        t_post (float): seconds after event (positive).
-    Returns:
-        aligned (list of 1D arrays): for each event, spike times relative to event.
-    """
-    aligned = []
-    for t0 in event_times:
-        start = t0 - t_pre
-        stop  = t0 + t_post
-        i0 = np.searchsorted(spikes, start)
-        i1 = np.searchsorted(spikes, stop)
-        aligned.append(spikes[i0:i1] - t0)
-    return aligned
-
-
-# ---------- Plotting helpers ----------
 
 def plot_population_heatmap(pop_rates, bins, ax, pre_time, clim_percentiles=(0.1, 99.9), cmap='viridis'):
     """
@@ -203,8 +156,6 @@ def plot_raster_from_aligned(aligned_spikes, ax, size=1, color='black', t_pre=No
     if (t_pre is not None) and (t_post is not None):
         ax.set_xlim([-t_pre, t_post])
 
-
-# ---------- Orchestrator ----------
 
 def plot_area_psth_and_raster(
     area_units_df,
@@ -281,23 +232,51 @@ def plot_area_psth_and_raster(
     return fig, axes, (pop_rates, bins), order
 
 
-def build_area_packet(area_name, good_units_df, spike_times_all_units,
-                      area_col='structure_acronym', sort_key=None, raster_unit_idx=0):
-    area_units = good_units_df[good_units_df[area_col] == area_name]
-    spike_times_by_unit = [spike_times_all_units[iu] for iu, _ in area_units.iterrows()]
-    if sort_key is not None and sort_key in area_units.columns:
-        order = np.argsort(area_units[sort_key].values)
-        spike_times_by_unit = [spike_times_by_unit[i] for i in order]
-    return dict(name=area_name, spikes=spike_times_by_unit, raster_idx=raster_unit_idx)
+def plot_unit_raster_aligned(unit_spike_times,
+                             trial_starts,
+                             trial_colors,
+                             t_pre=0.5, t_post=1.0,
+                             ax=None,
+                             separators=None):
+    """
+    For each trial in time order, plot spikes within [start - t_pre, start + t_post]
+    as a row in the raster. Color each row by that trial's image identity.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
 
+    for i, start in enumerate(trial_starts):
+        # select spikes around trial
+        mask = (unit_spike_times >= start - t_pre) & (unit_spike_times <= start + t_post)
+        rel_spikes = unit_spike_times[mask] - start
+
+        # scatter spikes for this trial
+        ax.scatter(rel_spikes,
+                   np.full_like(rel_spikes, i + 0.5, dtype=float),
+                   s=2, c=[trial_colors[i]], marker='|', linewidths=0.8)
+
+    # aesthetics
+    ax.axvline(0, color='k', lw=0.8, alpha=0.8)  # stimulus onset
+    if separators is not None:
+        for r in separators:
+            ax.axhline(r, color='0.8', lw=0.6, alpha=0.8)
+
+    ax.set_ylim(0, len(trial_starts))
+    ax.set_xlim(-t_pre, t_post)
+    # ax.set_ylabel("Trials (time-ordered)")
+    ax.set_xlabel("Time from stimulus")
+    # ax.set_title("Stimulus-aligned raster (single unit) by image_name")
+
+    return ax
 
 def plot_multi_area_psth_and_raster(
     area_packets,
     event_times,
+    stim_ids,
     time_before_change=1.0,
     duration=2.5,
     bin_size=0.01,
-    zscore_pop=[],
+    normalize='zscore',
     cmap='viridis',
     clim_percentiles=(0.1, 99.9),
     figsize_per_row=(12, 3.6),
@@ -346,9 +325,7 @@ def plot_multi_area_psth_and_raster(
         
         # ---------- if specified, z-score individual unit firing rates ----------
         plt_rate_label = 'Firing rate (Hz)'
-        if name in zscore_pop:
-            pop_rates = apply_zscore(rates=pop_rates, axis=1)
-            plt_rate_label = 'Z-scored firing rate (Hz)'
+        pop_rates = _normalize_rates(pop_rates, method=normalize, axis=1)
 
         # ---------- panels ----------
         ax_hm, ax_mean, ax_ras = axs[r, 0], axs[r, 1], axs[r, 2]
@@ -391,35 +368,6 @@ def plot_multi_area_psth_and_raster(
     return fig, axs, results
 
 
-def _normalize_rates(X, method='zscore', axis=1, eps=1e-9):
-    """
-    Normalize firing-rate matrix X (units x time) along `axis`.
-    method: 'zscore' | 'minmax' | 'none'
-    """
-    if method == 'none':
-        return X
-    X = np.asarray(X, float)
-    if method == 'zscore':
-        mu = X.mean(axis=axis, keepdims=True)
-        sd = X.std(axis=axis, keepdims=True) + eps
-        return (X - mu) / sd
-    elif method == 'minmax':
-        mn = X.min(axis=axis, keepdims=True)
-        mx = X.max(axis=axis, keepdims=True)
-        return (X - mn) / (mx - mn + eps)
-    else:
-        raise ValueError(f"unknown method: {method}")
-
-def compute_unit_covariance(pop_rates, normalize='zscore'):
-    """
-    pop_rates: (n_units, n_bins) firing rates (Hz)
-    Returns: (n_units, n_units) covariance matrix across time.
-    """
-    X = _normalize_rates(pop_rates, method=normalize, axis=1)
-    # np.cov expects variables as rows (units) and observations as columns (time)
-    # pop_rates is (units x time) already, so rowvar=True by default.
-    return np.cov(X)
-
 def plot_covariance_matrix(cov, ax, title='Covariance Matrix',
                            cmap='magma', clim_percentiles=(1, 99)):
     """
@@ -434,54 +382,6 @@ def plot_covariance_matrix(cov, ax, title='Covariance Matrix',
     return im
 
 
-import numpy as np
-import matplotlib.pyplot as plt
-
-# ---------- helpers ----------
-def compute_unit_covariance(pop_rates, normalize='zscore'):
-    """
-    pop_rates: (units, timebins)
-    normalize: None | 'zscore' | 'center' | 'l2'
-    returns: (units, units) covariance
-    """
-    X = np.asarray(pop_rates)
-    if normalize == 'zscore':
-        mu = X.mean(axis=1, keepdims=True)
-        sd = X.std(axis=1, keepdims=True) + 1e-9
-        X = (X - mu) / sd
-    elif normalize == 'center':
-        X = X - X.mean(axis=1, keepdims=True)
-    elif normalize == 'l2':
-        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
-    elif normalize is not None:
-        raise ValueError(f"Unknown normalize '{normalize}'")
-    return np.cov(X)
-
-
-
-def compute_unit_covariance(pop_rates, normalize='zscore'):
-    """
-    pop_rates: (units, timebins) mean trial-binned firing rates per unit.
-    normalize: None | 'zscore' | 'center' | 'l2'
-    returns: (units, units) covariance
-    """
-    X = np.asarray(pop_rates)
-    if X.ndim != 2:
-        raise ValueError("pop_rates must be 2D (units x timebins)")
-    if normalize == 'zscore':
-        mu = X.mean(axis=1, keepdims=True)
-        sd = X.std(axis=1, keepdims=True) + 1e-9
-        X = (X - mu) / sd
-    elif normalize == 'center':
-        X = X - X.mean(axis=1, keepdims=True)
-    elif normalize == 'l2':
-        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
-    elif normalize is not None:
-        raise ValueError(f"Unknown normalize '{normalize}'")
-    return np.cov(X)
-
-
-# ---- main: build pop_rates from spikes+events, then plot covariances ----
 def plot_area_covariances(
     area_packets,
     event_times,
@@ -581,7 +481,6 @@ def plot_area_covariances(
     return fig, axs, results
 
 
-
 def plot_area_covariances_with_eigs(
     area_packets,
     event_times,
@@ -589,34 +488,69 @@ def plot_area_covariances_with_eigs(
     duration=2.5,
     bin_size=0.01,
     normalize='zscore',
-    cmap='magma',
-    figsize_per_row=(15, 3.6),
+    cmap='RdBu_r',
+    figsize_per_row=(18, 3.6),   # widened for the extra column
     hspace=0.8,
     share_colorbar=False
 ):
     """
-    For each area: [Covariance heatmap | Eigenvalue spectrum].
+    For each area: [Covariance heatmap | Eigenvalue spectrum | First eigenvector | PCA (PC1–PC2 trajectory)].
     """
+    # from scipy.ndimage import gaussian_filter1d
+    # from scipy.signal import savgol_filter
+    # NEW: smooth PC scores in time (Savitzky–Golay)
+    # win_s = 0.15  # 150 ms
+    decim = 2  # keep every 2nd bin
+    # Xz_ds = Xz[::decim]
+   
+    
     bins = np.arange(0, duration + bin_size, bin_size)
     start_times = event_times - time_before_change
+    t_rel = bins[:-1] + bin_size/2.0 - time_before_change  # center-of-bin, relative to event
+    t_rel_ds = t_rel[::decim]
 
     results = []
     for pkt in area_packets:
         name = pkt.get('name', 'Area')
         spikes_all = pkt['spikes']
 
+        # --- Build population PSTHs (units x timebins)
         psths = []
         for st in spikes_all:
-            trial_counts = get_binned_triggered_spike_counts_fast(st, start_times, bins)
-            rates = trial_counts.mean(axis=0) / bin_size
+            trial_counts = get_binned_triggered_spike_counts_fast(st, start_times, bins)  # (n_trials, n_timebins)
+            rates = trial_counts.mean(axis=0) / bin_size                                   # (n_timebins,)
             psths.append(rates)
-        pop_rates = np.asarray(psths)
+        pop_rates = np.asarray(psths)  # (n_units, n_timebins)
 
-        cov = compute_unit_covariance(pop_rates, normalize=normalize)
+        # --- Covariance across units (features), over time
+        cov = compute_unit_covariance(pop_rates, normalize=normalize)  # expects (n_units, n_timebins)
         λ, eigvecs = np.linalg.eig(cov)
 
-        results.append({'area': name, 'pop_rates': pop_rates,
-                        'cov': cov, 'eigvals': λ, 'eigvecs': eigvecs})
+        # --- PCA over timepoints (observations) with units as features
+        # shape to (n_timebins, n_units)
+        X = pop_rates.T
+        # standardize features (units) across time to avoid dominance by high-rate units
+        Xz = StandardScaler(with_mean=True, with_std=True).fit_transform(X) if X.shape[1] > 1 else X
+        pca = PCA(n_components=min(10, Xz.shape[1]))
+        scores = pca.fit_transform(Xz)  # (n_timebins, n_components)
+        evr = pca.explained_variance_ratio_
+
+        
+
+        # win_bins = max(5, (int(round(win_s / (bin_size * decim))) // 2) * 2 + 1)  # odd >=5
+        # scores = savgol_filter(scores, window_length=win_bins, polyorder=3, axis=0)
+
+        results.append({
+            'area': name,
+            'pop_rates': pop_rates,
+            'cov': cov,
+            'eigvals': λ,
+            'eigvecs': eigvecs,
+            'pca_scores': scores,
+            'pca_evr': evr,
+            't_rel': t_rel,
+            't_rel_ds': t_rel_ds
+        })
 
     # shared color scale
     if share_colorbar:
@@ -625,9 +559,9 @@ def plot_area_covariances_with_eigs(
     else:
         vmin = vmax = None
 
-    # make figure
+    # --- Figure (now 4 columns)
     n = len(results)
-    fig, axs = plt.subplots(n, 3,
+    fig, axs = plt.subplots(n, 4,
                             figsize=(figsize_per_row[0], figsize_per_row[1]*n),
                             squeeze=False)
 
@@ -642,17 +576,203 @@ def plot_area_covariances_with_eigs(
 
         # Eigenvalue spectrum
         ax_eig = axs[i, 1]
-        ax_eig.plot(res['eigvals'], marker='o', color='k')
+        ax_eig.plot(np.sort(res['eigvals'])[::-1], marker='o', color='k')
         ax_eig.set_title(f"{res['area']} — eigenvalue spectrum", fontsize=10)
-        ax_eig.set_xlabel('Eigenvector index')
-        ax_eig.set_ylabel('Variance explained (λ)')
-        
+        ax_eig.set_xlabel('Component')
+        ax_eig.set_ylabel('Variance (λ)')
+
+        # First eigenvector
         ax_vec = axs[i, 2]
         ax_vec.plot(res['eigvecs'][:, 0], marker='o')
         ax_vec.set_title(f"{res['area']} — first eigenvector", fontsize=10)
         ax_vec.set_xlabel('Unit')
-        ax_vec.set_ylabel('Coefficient')
+        ax_vec.set_ylabel('Coeff.')
+
+        # PCA: PC1–PC2 trajectory over time
+        ax_pca = axs[i, 3]
+        scores = res['pca_scores']
+        if scores.shape[1] >= 2:
+            pts = np.column_stack([scores[:, 0], scores[:, 1]])
+            segs = np.stack([pts[:-1], pts[1:]], axis=1)  # (T-1, 2, 2)
+            # draw time-ordered path
+            ax_pca.plot(scores[:, 0], scores[:, 1], '-o', ms=2)
+            # mark event time (t=0) if it falls within window
+            # NEW: color by time with LineCollection
+            lc = LineCollection(segs, cmap='viridis', array=res['t_rel_ds'][1:], linewidths=2)
+            ax_pca.add_collection(lc)
+            ax_pca.autoscale()
+            cbar = fig.colorbar(lc, ax=ax_pca, fraction=0.046, pad=0.04)
+            cbar.set_label('Time (s)')
+
+            # # NEW: sparse markers (~every 100 ms)
+            # mark_every = max(1, int(round(0.1 / (bin_size * decim))))
+            # ax_pca.plot(pts[::mark_every, 0], pts[::mark_every, 1], 'o', ms=3, color='k', alpha=0.6)
+
+            zero_idx = np.argmin(np.abs(res['t_rel']))
+            ax_pca.scatter(scores[zero_idx, 0], scores[zero_idx, 1], s=40, edgecolor='k', facecolor='none', label='event (t=0)')
+            ax_pca.set_title(f"{res['area']} — PCA traj (PC1 vs PC2)\nEVR: {res['pca_evr'][:2].sum():.2f}", fontsize=10)
+            ax_pca.set_xlabel('PC1'); ax_pca.set_ylabel('PC2')
+            ax_pca.legend(loc='best', fontsize=8, frameon=False)
+        else:
+            ax_pca.text(0.5, 0.5, "PCA<2 comps", ha='center', va='center')
+            ax_pca.set_axis_off()
 
     fig.tight_layout()
     fig.subplots_adjust(hspace=hspace)
     return fig, axs, results
+
+
+def plot_unit_raster_simple(unit_spike_times, trials, trial_colors, change_rows,
+                            block_mids, block_names, t_pre=0.5, t_post=1., ax=None, start_col="start_time"):
+    """Thin wrapper around your existing plot_unit_raster_aligned."""
+    if ax is None:
+        _, ax = plt.subplots(figsize=(9, 6))
+    ax = plot_unit_raster_aligned(
+        unit_spike_times=np.asarray(unit_spike_times),
+        trial_starts=trials[start_col].values,
+        trial_colors=trial_colors,
+        t_pre=t_pre, t_post=t_post,
+        ax=ax,
+        separators=change_rows
+    )
+    ax.set_yticks(block_mids)
+    ax.set_yticklabels(block_names)
+    return ax
+
+def _gauss1d(x, sigma_bins):
+    if (sigma_bins is None) or (sigma_bins <= 0): return x
+    w = int(max(3, round(6 * sigma_bins))) | 1  # odd length
+    c = w // 2
+    g = np.exp(-0.5 * (np.arange(w) - c)**2 / (sigma_bins**2))
+    g /= g.sum()
+    return np.convolve(x, g, mode="same")
+
+def _boxcar1d(x, win_bins):
+    if (win_bins is None) or (win_bins <= 1): return x
+    k = np.ones(int(win_bins)) / int(win_bins)
+    return np.convolve(x, k, mode="same")
+    
+def plot_subpop_spikes(unit_spike_times, trials, colors, sep, mids, names,
+                       t_pre=0.5, t_post=1.0, bin_size=0.1,
+                       smooth_kind=None, smooth_value=None, ax=None, x_label="Time from stimulus (s)", start_col="start_time"):
+    if ax is None:
+        _, ax = plt.subplots()
+
+    bins = np.arange(-t_pre, t_post + bin_size, bin_size)
+    X = []
+    for t0 in trials[start_col].values:
+        rel = unit_spike_times - t0
+        rel = rel[(rel >= -t_pre) & (rel <= t_post)]
+        X.append(np.histogram(rel, bins=bins)[0])
+    X = np.asarray(X)
+
+    starts = np.r_[0, sep]; ends = np.r_[sep, len(trials)]
+    t = bins[:-1]
+
+    for s, e, name in zip(starts, ends, names):
+        grp = X[s:e]
+        m, sd = grp.mean(axis=0), grp.std(axis=0)
+
+        if smooth_kind == "gaussian":
+            m, sd = _gauss1d(m, smooth_value), _gauss1d(sd, smooth_value)
+        elif smooth_kind == "boxcar":
+            m, sd = _boxcar1d(m, smooth_value), _boxcar1d(sd, smooth_value)
+
+        ax.plot(t, m, color=colors[s], label=name)
+        ax.fill_between(t, m - sd, m + sd, color=colors[s], alpha=0.3)
+
+    ax.axvline(0, color="k", ls="--", lw=1)
+    ax.set_xlabel(x_label)
+    # ax.set_xlabel("Time from stimulus (s)"); ax.set_ylabel("Spikes")
+    # ax.legend()
+    return ax
+
+def plot_area_grid_combined(
+    area, good_units, spike_times, n_units, groupings,
+    subplots=("raster", "mean±sd"),
+    t_pre=0.5, t_post=1.0, bin_size=0.1,
+    smooth_kind=None, smooth_value=None,
+    pick="first", seed=0, figsize_per_row=(4, 2.5), sharex=True,
+    extras=("autocorr",),                  
+    acg_bin_ms=1.0, acg_win_ms=60.0,     
+    acg_refractory_ms=2.0             
+):
+    """
+    One grid: n_units rows × (len(groupings) * len(subplots)) cols.
+    Each grouping can choose its own key_col and alignment start_col.
+    """
+    # --- pick units ---
+    rng = np.random.default_rng(seed)
+    area_units = good_units[good_units["structure_acronym"] == area].index.to_numpy()
+    sel = rng.choice(area_units, size=min(n_units, len(area_units)), replace=False) if pick=="random" else area_units[:n_units]
+
+    n_rows = len(sel)
+    n_cols = len(subplots) * len(groupings) + len(extras)
+    figsize = (figsize_per_row[0] * n_cols, figsize_per_row[1] * n_rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, sharex=False)
+    # fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, sharex=sharex, sharey=False) 
+
+    # if extra == "autocorr":
+    # ax.get_shared_y_axes().remove(ax)  # <— frees this axis
+    # plot_autocorrelogram(st, bin_ms=acg_bin_ms, win_ms=acg_win_ms,
+    #                      refractory_ms=acg_refractory_ms, ax=ax)
+
+    
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = axes[None, :]
+    elif n_cols == 1:
+        axes = axes[:, None]
+
+    # --- grid fill ---
+    for r, iu in enumerate(sel):
+        st = spike_times[iu]
+        for g, G in enumerate(groupings):
+            for s, kind in enumerate(subplots):
+                ax = axes[r, g*len(subplots) + s]
+                if kind == "raster":
+                    plot_unit_raster_simple(st, G["trials"], G["colors"], G["sep"], G["mids"], G["names"],
+                                            t_pre=G["t_pre"], t_post=G["t_post"], ax=ax, start_col=G["start_col"])
+                elif kind == "mean±sd":
+                    plot_subpop_spikes(st, G["trials"], G["colors"], G["sep"], G["mids"], G["names"],
+                                       t_pre=G["t_pre"], t_post=G["t_post"], bin_size=G["bin_size"],
+                                       smooth_kind=G["smooth_kind"], smooth_value=G["smooth_value"], ax=ax, start_col=G["start_col"])
+
+                if r == 0:
+                    ax.set_title(f"{G['label']} • {kind}")
+                if s == 0:
+                    ax.set_ylabel(f"unit {iu}")
+
+        base = len(groupings) * len(subplots)                   
+        for e, extra in enumerate(extras):
+            ax = axes[r, base + e]
+            if extra == "autocorr":
+                # pos = ax.get_position()          # break sharing by rebuilding the axis
+                # fig.delaxes(ax)
+                # ax = fig.add_axes(pos)
+                ax = plot_autocorrelogram(st, bin_ms=acg_bin_ms, win_ms=acg_win_ms,
+                refractory_ms=acg_refractory_ms, ax=ax)
+
+                # plot_autocorrelogram(st, bin_ms=acg_bin_ms, win_ms=acg_win_ms,
+                #                     refractory_ms=acg_refractory_ms, ax=ax)
+                if r == 0:
+                    ax.set_title(f"Autocorr • ±{int(acg_win_ms)} ms")
+            else:
+                ax.set_axis_off()
+    plt.tight_layout()
+    return fig, axes
+
+def plot_autocorrelogram(st, *, bin_ms=1.0, win_ms=60.0, refractory_ms=2.0, ax=None):
+    spk = SpikeTrain(st * s, t_start=st.min() * s, t_stop=st.max() * s + 1 *s)
+    lags_ms, counts = generate_autocorr_data(spk, bin_ms + 1, win_ms)
+    if ax is None:
+        _, ax = plt.subplots(1, 1, figsize=(4, 4))
+    ax.bar(lags_ms, counts, width=bin_ms, color='gray', linewidth=0.3)
+    ax.axvspan(-refractory_ms, refractory_ms, color='orange', alpha=0.2)
+    ax.axvline(refractory_ms, color='black', linewidth=0.2)
+    ax.axvline(-refractory_ms, color='black', linewidth=0.2)
+    ax.set_xlabel('Time (ms)')
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    return ax

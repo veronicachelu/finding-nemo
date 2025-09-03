@@ -1,4 +1,5 @@
-# hash:sha256:3acea2b98eea43d5b19c559862fc9184493a2f998f7b9c943464bac2c938b695
+# hash:sha256:68b5d6b92a2945b97a9e5f33778a30b0ac5f3eaf56f257509447b4b3f23b78a1
+
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/jupyterlab:3.6.1-miniconda4.12.0-python3.9-ubuntu20.04
 
@@ -8,6 +9,9 @@ COPY git-askpass /
 
 RUN pip install -U --no-cache-dir \
     allensdk==2.16.2 \
+    elephant==1.1.1 \
+    neo==0.14.0 \
+    seaborn==0.13.2 \
     sklearn==0.0
 
 ADD "https://github.com/coder/code-server/releases/download/v4.100.3/code-server-4.100.3-linux-amd64.tar.gz" /.code-server/code-server.tar.gz
