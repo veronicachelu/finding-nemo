@@ -1,6 +1,9 @@
 import numpy as np
 from matplotlib import pyplot as plt
 import matplotlib as mpl
+from matplotlib.cm import get_cmap
+from matplotlib.colors import Normalize
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix
@@ -9,6 +12,8 @@ import data_utils
 import importlib
 importlib.reload(data_utils)
 from data_utils import *
+
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 def create_raster(
     spike_times,
@@ -480,6 +485,217 @@ def plot_area_covariances(
     fig.subplots_adjust(hspace=hspace)
     return fig, axs, results
 
+def event_times_by_key(trials_df, start_col, time_before_change=0.25):
+    """
+    trials_df: has columns ['start_time','key'] where 'key' is image_name
+    Returns dict: key -> np.array of (aligned) event start times
+    """
+    # keep original appearance order of keys
+    key_groups = {}
+    for k, g in trials_df.groupby("key", sort=False):
+        key_groups[k] = g[start_col].to_numpy() - time_before_change
+    return key_groups
+
+
+def build_image_locked_rates(spikes_all, trials_df, *, start_col="start_time", 
+t_pre=0.25, t_post=0.75,
+ bin_size=0.01):
+    """
+    spikes_all: list[ndarray], each array is spike times (s) for one unit
+    trials_df: DataFrame with ['start_time','key']
+    Returns:
+      pop_concat: (n_units, n_keys * n_bins) concatenated mean-rate vectors
+      per_key_unit_rates: dict key -> (n_units, n_bins) mean rates per key
+      key_slices: dict key -> slice into the concatenated vector
+      keys: list of keys in the order used for concatenation
+      bins: histogram bin edges used (relative, from 0..duration)
+    """
+
+    # bins are relative [0, duration] as your get_binned_* expects
+    duration = t_pre + t_post
+    bins = np.arange(0, duration + bin_size, bin_size)
+    n_bins = len(bins) - 1
+
+    key2starts = event_times_by_key(trials_df, start_col, time_before_change=t_pre)
+    keys = list(key2starts.keys())
+
+    # pre-alloc containers
+    n_units = len(spikes_all)
+    per_key_unit_rates = {k: np.zeros((n_units, n_bins), dtype=float) for k in keys}
+
+    # compute mean rate per key per unit
+    for ui, st in enumerate(spikes_all):
+        for k in keys:
+            starts = key2starts[k]
+            # starts = starts - time_before_change
+            # (n_trials, n_bins) counts
+            trial_counts = get_binned_triggered_spike_counts_fast(st, starts, bins)
+            mean_rate = trial_counts.mean(axis=0) / bin_size
+            
+            # mu = mean_rate.mean(axis=0, keepdims=True)
+            # sd = mean_rate.std(axis=0, keepdims=True) + 1e-9
+            # mean_rate = (mean_rate - mu) / sd
+            per_key_unit_rates[k][ui, :] = mean_rate
+
+    # concatenate in key order to get the “image-locked” vector per unit
+    pop_concat = np.concatenate([per_key_unit_rates[k] for k in keys], axis=1)
+
+    # handy slices so you know where each key lives inside the big vector
+    key_slices = {}
+    start = 0
+    for k in keys:
+        key_slices[k] = slice(start, start + n_bins)
+        start += n_bins
+
+    return pop_concat, per_key_unit_rates, key_slices, keys, bins
+
+
+# def plot_area_covariances_with_eigs2(
+#     area_packets,
+#     G,
+#     time_before_change=1.0,
+#     duration=2.5,
+#     bin_size=0.01,
+#     normalize='zscore',
+#     cmap='viridis',
+#     figsize_per_row=(18, 3.6),   # widened for the extra column
+#     hspace=0.8,
+#     share_colorbar=False
+# ):
+#     """
+#     For each area: [Covariance heatmap | Eigenvalue spectrum | First eigenvector | PCA (PC1–PC2 trajectory)].
+#     """
+#     decim = 2  # keep every 2nd bin
+#     t_pre = 0.25
+#     t_post = 1.
+#     bins = np.arange(0, duration + bin_size, bin_size)
+#     event_times = G["trials"]["start_time"].values
+#     image_names = G["names"]
+#     colors = G["colors"]
+#     start_times = event_times - time_before_change
+#     t_rel = bins[:-1] + bin_size/2.0 - time_before_change  # center-of-bin, relative to event
+#     t_rel_ds = t_rel[::decim]
+
+#     results = []
+   
+#     for pkt in area_packets:
+#         spikes_all = pkt['spikes']
+#         name = pkt.get('name', 'Area')
+#         pop_concat, per_key_unit_rates, key_slices, keys, bins = build_image_locked_rates(
+#             spikes_all,
+#             G["trials"],
+#             duration=G["t_post"] - G["t_pre"],
+#             bin_size=G["bin_size"],
+#             time_before_change=G["t_pre"]
+#         )
+#         # plot_image_locked_matrix(pop_concat, keys, key_slices, cmap="viridis")
+
+#         # --- Build population PSTHs (units x timebins)
+#         # psths = []
+#         # for st in spikes_all:
+#         #     trial_counts = get_binned_triggered_spike_counts_fast(st, event_times, bins)  # (n_trials, n_timebins)
+#         #     rates = trial_counts / bin_size                                   # (n_timebins,)
+#         #     psths.append(rates.reshape(-1))
+#         # pop_rates = np.asarray(psths)  # (n_units, n_timebins)
+
+#         # --- Covariance across units (features), over time
+#         cov = compute_unit_covariance(pop_concat, normalize=normalize)  # expects (n_units, n_timebins)
+#         λ, eigvecs = np.linalg.eig(cov)
+
+#         # --- PCA over timepoints (observations) with units as features
+#         # shape to (n_timebins, n_units)
+#         X = pop_concat.T
+#         # standardize features (units) across time to avoid dominance by high-rate units
+#         Xz = StandardScaler(with_mean=True, with_std=True).fit_transform(X) if X.shape[1] > 1 else X
+#         pca = PCA(n_components=min(10, Xz.shape[1]))
+#         scores = pca.fit_transform(Xz)  # (n_timebins, n_components)
+#         evr = pca.explained_variance_ratio_
+
+
+#         # win_bins = max(5, (int(round(win_s / (bin_size * decim))) // 2) * 2 + 1)  # odd >=5
+#         # scores = savgol_filter(scores, window_length=win_bins, polyorder=3, axis=0)
+
+#         results.append({
+#             'area': name,
+#             'pop_rates': pop_concat,
+#             'cov': cov,
+#             'eigvals': λ,
+#             'eigvecs': eigvecs,
+#             'pca_scores': scores,
+#             'pca_evr': evr,
+#             't_rel': t_rel,
+#             't_rel_ds': t_rel_ds
+#         })
+
+#     # shared color scale
+#     if share_colorbar:
+#         all_cov_vals = np.concatenate([r['cov'].ravel() for r in results])
+#         vmin, vmax = np.percentile(all_cov_vals, [1, 99])
+#     else:
+#         vmin = vmax = None
+
+#     # --- Figure (now 4 columns)
+#     n = len(results)
+#     fig, axs = plt.subplots(n, 4,
+#                             figsize=(figsize_per_row[0], figsize_per_row[1]*n),
+#                             squeeze=False)
+
+#     for i, res in enumerate(results):
+#         # Covariance heatmap
+#         ax_cov = axs[i, 0]
+#         im = ax_cov.imshow(res['cov'], aspect='auto', cmap=cmap, vmin=vmin, vmax=vmax)
+#         ax_cov.set_title(f"{res['area']} — covariance", fontsize=10)
+#         ax_cov.set_xlabel('Unit'); ax_cov.set_ylabel('Unit')
+#         cb = fig.colorbar(im, ax=ax_cov, fraction=0.046, pad=0.04)
+#         cb.set_label('Covariance')
+
+#         # Eigenvalue spectrum
+#         ax_eig = axs[i, 1]
+#         ax_eig.plot(np.sort(res['eigvals'])[::-1], marker='o', color='k')
+#         ax_eig.set_title(f"{res['area']} — eigenvalue spectrum", fontsize=10)
+#         ax_eig.set_xlabel('Component')
+#         ax_eig.set_ylabel('Variance (λ)')
+
+#         # First eigenvector
+#         ax_vec = axs[i, 2]
+#         ax_vec.plot(res['eigvecs'][:, 0], marker='o')
+#         ax_vec.set_title(f"{res['area']} — first eigenvector", fontsize=10)
+#         ax_vec.set_xlabel('Unit')
+#         ax_vec.set_ylabel('Coeff.')
+
+#         # PCA: PC1–PC2 trajectory over time
+#         ax_pca = axs[i, 3]
+#         scores = res['pca_scores']
+#         if scores.shape[1] >= 2:
+#             pts = np.column_stack([scores[:, 0], scores[:, 1]])
+#             segs = np.stack([pts[:-1], pts[1:]], axis=1)  # (T-1, 2, 2)
+#             # draw time-ordered path
+#             ax_pca.plot(scores[:, 0], scores[:, 1], '-o', ms=2)
+#             # mark event time (t=0) if it falls within window
+#             # NEW: color by time with LineCollection
+#             lc = LineCollection(segs, cmap='viridis', array=res['t_rel_ds'][1:], linewidths=2)
+#             ax_pca.add_collection(lc)
+#             ax_pca.autoscale()
+#             cbar = fig.colorbar(lc, ax=ax_pca, fraction=0.046, pad=0.04)
+#             cbar.set_label('Time (s)')
+
+#             # # NEW: sparse markers (~every 100 ms)
+#             # mark_every = max(1, int(round(0.1 / (bin_size * decim))))
+#             # ax_pca.plot(pts[::mark_every, 0], pts[::mark_every, 1], 'o', ms=3, color='k', alpha=0.6)
+
+#             zero_idx = np.argmin(np.abs(res['t_rel']))
+#             ax_pca.scatter(scores[zero_idx, 0], scores[zero_idx, 1], s=40, edgecolor='k', facecolor='none', label='event (t=0)')
+#             ax_pca.set_title(f"{res['area']} — PCA traj (PC1 vs PC2)\nEVR: {res['pca_evr'][:2].sum():.2f}", fontsize=10)
+#             ax_pca.set_xlabel('PC1'); ax_pca.set_ylabel('PC2')
+#             ax_pca.legend(loc='best', fontsize=8, frameon=False)
+#         else:
+#             ax_pca.text(0.5, 0.5, "PCA<2 comps", ha='center', va='center')
+#             ax_pca.set_axis_off()
+
+#     fig.tight_layout()
+#     fig.subplots_adjust(hspace=hspace)
+#     return fig, axs, results
+
 
 def plot_area_covariances_with_eigs(
     area_packets,
@@ -496,14 +712,8 @@ def plot_area_covariances_with_eigs(
     """
     For each area: [Covariance heatmap | Eigenvalue spectrum | First eigenvector | PCA (PC1–PC2 trajectory)].
     """
-    # from scipy.ndimage import gaussian_filter1d
-    # from scipy.signal import savgol_filter
-    # NEW: smooth PC scores in time (Savitzky–Golay)
-    # win_s = 0.15  # 150 ms
     decim = 2  # keep every 2nd bin
-    # Xz_ds = Xz[::decim]
    
-    
     bins = np.arange(0, duration + bin_size, bin_size)
     start_times = event_times - time_before_change
     t_rel = bins[:-1] + bin_size/2.0 - time_before_change  # center-of-bin, relative to event
@@ -776,3 +986,656 @@ def plot_autocorrelogram(st, *, bin_ms=1.0, win_ms=60.0, refractory_ms=2.0, ax=N
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     return ax
+
+
+def plot_image_locked_matrix_old(pop_concat, keys, key_slices, cmap="viridis"):
+    """
+    pop_concat: (n_units, n_keys*n_bins)
+    keys: list of image keys (ordered)
+    key_slices: dict mapping key -> slice into the concat axis
+    """
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    im = ax.imshow(pop_concat, aspect="auto", cmap=cmap,
+                   interpolation="nearest")
+    bin_size = 0.01          # keep consistent with build_image_locked_rates
+    time_before_change = 0.25
+    onset_bin = 0#int(round(time_before_change / bin_size))
+    # add color blocks or separators per image
+    # give each key a color
+    cm = plt.get_cmap("tab20")
+    for i, k in enumerate(keys):
+        sl = key_slices[k]
+        color = cm(i % cm.N)
+
+        # stimulus onset (one line per image block)  ⟵ ADD
+        x0 = sl.start + onset_bin
+        ax.axvline(x0, ymin=0, ymax=1, linewidth=1.2, color=color, alpha=0.9)
+
+        # ax.add_patch(
+        #     patches.Rectangle(
+        #         (sl.start, -0.5),        # (x,y) lower left
+        #         sl.stop - sl.start,      # width
+        #         pop_concat.shape[0],     # height = n_units
+        #         fill=False,
+        #         edgecolor=color,
+        #         linewidth=2
+        #     )
+        # )
+        # optional: put the key name centered at the top
+        xmid = (sl.start + sl.stop) / 2
+        ax.text(xmid, -1, k, ha="center", va="bottom",
+                rotation=90, fontsize=8, color=color)
+
+    fig.colorbar(im, ax=ax, label="Firing rate (Hz)")
+    ax.set_xlabel("Concatenated time bins (by image)")
+    ax.set_ylabel("Unit index")
+    plt.tight_layout()
+    plt.show()
+
+
+
+def plot_image_locked_matrix(
+    pop_concat, keys, key_slices, *,
+    bin_size=0.01, time_before_change=0.25,
+    cmap="viridis", block_cmap="tab20",
+    figsize=(12, 6), annotate=True, draw_onset=True
+):
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(pop_concat, aspect="auto", cmap=cmap, interpolation="nearest")
+
+    onset_bin = int(round(time_before_change / bin_size))
+    cm = plt.get_cmap(block_cmap)
+    for i, k in enumerate(keys):
+        sl = key_slices[k]
+        color = cm(i % cm.N)
+        if draw_onset:
+            ax.axvline(sl.start + onset_bin, ymin=0, ymax=1, lw=1.2, color=color, alpha=0.9)
+        if annotate:
+            ax.text((sl.start + sl.stop) / 2, -1, str(k), ha="center", va="bottom",
+                    rotation=90, fontsize=8, color=color)
+
+    fig.colorbar(im, ax=ax, label="Firing rate (Hz)")
+    ax.set(xlabel=f"Concatenated bins (bin={bin_size}s)", ylabel="Unit index")
+    fig.tight_layout()
+    return fig, ax
+
+# def plot_pca_trajs_3d_multi(areas, groups, start_cols, *, n_components=3, win=7,
+#                             time_before_change=0.25, ncols=4,
+#                             random_state=0, cmap_name=None):
+
+def build_per_trial_unit_rates(spikes_all, trials_df, *, start_col="start_time",
+                               t_pre=0.25, t_post=0.75, bin_size=0.01):
+    """
+    Returns: per_key_unit_trials (dict key -> list[(n_units, n_bins)]), keys, bins
+    """
+    import numpy as np
+    duration = t_pre + t_post
+    bins = np.arange(0, duration + bin_size, bin_size)
+    n_bins = len(bins) - 1
+    keys = list(trials_df['key'].drop_duplicates().values)
+
+    per_key_unit_trials = {k: [] for k in keys}
+    for k, g in trials_df.groupby('key', sort=False):
+        starts = g[start_col].values - t_pre
+        for st in starts:
+            edges = st + bins
+            counts = np.stack([np.histogram(u_spk, edges)[0] for u_spk in spikes_all], axis=0)
+            per_key_unit_trials[k].append(counts / bin_size)
+    return per_key_unit_trials, keys, bins
+
+def plot_pca_trajs_3d_multi(areas, groups, start_cols,
+                            *, n_components=3, win=7, t_pre=0.25, t_post=0.75,
+                            ncols=4, random_state=0, cmap_name=None,
+                            show_trials=True, trial_alpha=0.35,
+                            trial_lw=0.7, mean_lw=2.2,
+                            max_trials_per_key=None,
+                            n_trial_overlays=4,
+                            per_key_trial_starts=None,
+                            abs_time_cmap="viridis"):
+    figs = {}
+    for area, spikes_all in areas.items():
+        trials = groups[area]
+        start_col = start_cols[area]
+
+        # build matrices
+        pop_concat, per_key_unit_rates, key_slices, keys, bins = build_image_locked_rates(
+            spikes_all, trials, start_col=start_col,
+            t_pre=t_pre, t_post=t_post, bin_size=0.01
+        )
+        per_key_unit_trials, _, _ = build_per_trial_unit_rates(
+            spikes_all, trials, start_col=start_col,
+            t_pre=t_pre, t_post=t_post, bin_size=0.01
+        )
+
+        fig, axes = plot_pca_trajs_3d_flat(
+            pop_concat, per_key_unit_rates, keys, bins,
+            n_components=n_components, win=win, ncols=ncols,
+            
+            random_state=random_state, cmap_name=cmap_name,
+            per_key_unit_trials=per_key_unit_trials,
+            show_trials=show_trials, trial_alpha=trial_alpha,
+            trial_lw=trial_lw, mean_lw=mean_lw,
+            max_trials_per_key=max_trials_per_key,
+            n_trial_overlays=n_trial_overlays,               # <— forward
+            per_key_trial_starts=per_key_trial_starts.get(area, {}) if per_key_trial_starts else None,
+            abs_time_cmap=abs_time_cmap                      # <— forward
+        )
+
+        fig.suptitle(area, fontsize=12)
+        figs[area] = (fig, axes)
+    return figs
+
+def plot_pca_trajs_3d_multi_old(areas, groups, start_cols, *, 
+    n_components=3, win=7, time_before_change=0.25, ncols=4, random_state=0, cmap_name=None,
+    show_trials=True, trial_alpha=0.35, trial_lw=0.7, mean_lw=2.2,
+    max_trials_per_key=None):
+
+    """
+    areas: dict area_name -> spikes_all (list of spike time arrays per unit)
+    groups: dict area_name -> trials_df (with ['start_time','key'])
+    """
+    figs = {}
+    for area, spikes_all in areas.items():
+        trials = groups[area]
+        start_col = start_cols[area]
+
+        pop_concat, per_key_unit_rates, key_slices, keys, bins = build_image_locked_rates(
+            spikes_all, trials, start_col=start_col, t_pre=t_pre, t_post=t_post, bin_size=0.01,
+        )
+        per_key_unit_trials, keys2, bins2 = build_per_trial_unit_rates(
+            spikes_all, trials, start_col=start_col,
+            t_pre=t_pre, t_post=t_post, bin_size=0.01
+        )
+
+        # --- do PCA/plot just like before, but return fig, axes ---
+        # fig, axes = plot_pca_trajs_3d_flat(
+        #     pop_concat, per_key_unit_rates, keys, bins,
+        #     n_components=n_components, win=win,
+        #     ncols=ncols, time_before_change=time_before_change,
+        #     random_state=random_state, cmap_name=cmap_name
+        # )
+        fig, axes = plot_pca_trajs_3d_flat(
+            pop_concat, per_key_unit_rates, keys, bins,
+            n_components=n_components, win=win,
+            ncols=ncols, time_before_change=time_before_change,
+            random_state=random_state, cmap_name=cmap_name,
+            per_key_unit_trials=per_key_unit_trials,
+            show_trials=show_trials, trial_alpha=trial_alpha,
+            trial_lw=trial_lw, mean_lw=mean_lw,
+            max_trials_per_key=max_trials_per_key
+        )
+
+        fig.suptitle(area, fontsize=12)
+        figs[area] = (fig, axes)
+    return figs
+
+# def plot_pca_trajs_3d_flat(pop_concat, per_key_unit_rates, keys, bins,
+#                       *, n_components=3, win=7, ncols=4,
+#                       time_before_change=0.25, random_state=0, cmap_name=None,
+#                       per_key_unit_trials=None, show_trials=True,
+#                       trial_alpha=0.35, trial_lw=0.7, mean_lw=2.2,
+#                       max_trials_per_key=None):
+#     """
+#     Plot smoothed 3D PCA trajectories: one subplot per key.
+
+#     pop_concat: (n_units, n_keys*n_bins) matrix used to fit PCA (samples=time, features=units)
+#     per_key_unit_rates: dict key -> (n_units, n_bins) mean rates
+#     keys: ordered list of keys
+#     bins: 1D array of bin edges (len = n_bins+1)
+#     """
+#     # --- global PCA on timebins x units ---
+#     X = pop_concat.T
+#     mu, sd = X.mean(0), X.std(0) + 1e-9
+#     Xz = (X - mu) / sd
+#     pca = PCA(n_components=n_components, random_state=random_state).fit(Xz)
+
+#     def project(R):  # (n_units, n_bins) -> (n_bins, n_components)
+#         return ((R.T - mu) / sd) @ pca.components_.T
+
+#     # --- smooth per-key trajectories ---
+#     ker = np.ones(win) / win
+#     traj = {k: np.column_stack([np.convolve(project(per_key_unit_rates[k])[:, i], ker, "same")
+#                                 for i in range(n_components)]) for k in keys}
+
+#     # unified limits
+#     allP = np.vstack(list(traj.values()))
+#     lims = [(allP[:, i].min(), allP[:, i].max()) for i in range(3)]
+
+#     # colors
+#     cmap = plt.get_cmap(cmap_name or ('tab20' if len(keys) > 10 else 'tab10'))
+#     key_color = {k: cmap(i % cmap.N) for i, k in enumerate(keys)}
+
+#     # grid
+#     # n = len(keys)
+#     # nrows = (n + ncols - 1) // ncols
+#     # fig = plt.figure(figsize=(4*ncols, 3.6*nrows))
+
+#     # grid
+#     n = len(keys)
+#     nrows, ncols = 1, n          # <-- force one row
+#     fig = plt.figure(figsize=(4*ncols, 3.6))   # <-- height for one row only
+
+#     t_rel = bins[:-1] - time_before_change
+#     onset_idx = int(np.argmin(np.abs(t_rel)))
+
+#     # optional thin per-trial overlays
+#     if show_trials and (per_key_unit_trials is not None) and (k in per_key_unit_trials):
+#         trials_list = per_key_unit_trials[k]
+#         if max_trials_per_key is not None:
+#             trials_list = trials_list[:max_trials_per_key]
+#         for Rt in trials_list:
+#             Pt = ((Rt.T - mu) / sd) @ pca.components_.T
+#             if win > 1:
+#                 kker = np.ones(win) / win
+#                 Pt = np.column_stack([np.convolve(Pt[:, i], kker, "same") for i in range(n_components)])
+#             ax.plot(Pt[:, 0], Pt[:, 1], Pt[:, 2],
+#                     lw=trial_lw, alpha=trial_alpha, color=key_color[k], zorder=1)
+
+
+#     axes = {}
+#     for i, k in enumerate(keys, 1):
+#         ax = fig.add_subplot(nrows, ncols, i, projection="3d")
+#         P = traj[k][:, :3]  # first 3 PCs for 3D
+#         ax.plot(P[:, 0], P[:, 1], P[:, 2], lw=mean_lw, color=key_color[k], alpha=0.95)
+#         # ax.plot(P[:, 0], P[:, 1], P[:, 2], lw=1.6, color=key_color[k], alpha=0.95)
+#         ax.scatter(P[onset_idx, 0], P[onset_idx, 1], P[onset_idx, 2],
+#                    s=28, edgecolor="k", facecolor="w", linewidth=0.6)
+#         ax.set_xlim(lims[0]); ax.set_ylim(lims[1]); ax.set_zlim(lims[2])
+#         ax.set_title(str(k), fontsize=9)
+#         ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); ax.set_zlabel("PC3")
+#         axes[k] = ax
+
+#     fig.tight_layout()
+#     return fig, axes
+
+def plot_pca_trajs_3d_flat(pop_concat, per_key_unit_rates, keys, bins,
+                      *, n_components=3, win=7, ncols=4,
+                      t_pre=0.25, t_post=0.75, random_state=0, cmap_name=None,
+                      per_key_unit_trials=None, show_trials=True,
+                      trial_alpha=0.35, trial_lw=0.7, mean_lw=2.2,
+                      n_trial_overlays=4, max_trials_per_key=None,
+                      per_key_trial_starts=None,        # NEW: dict key -> list[float secs]
+                      abs_time_cmap="viridis"):          # NEW
+
+    # --- global PCA on timebins x units ---
+    X = pop_concat.T
+    mu, sd = X.mean(0), X.std(0) + 1e-9
+    pca = PCA(n_components=n_components, random_state=random_state).fit((X - mu) / sd)
+
+    def project(R):  # (n_units, n_bins) -> (n_bins, n_components)
+        return ((R.T - mu) / sd) @ pca.components_.T
+
+    # --- smooth per-key trajectories ---
+    traj = {
+        k: np.column_stack([np.convolve(project(per_key_unit_rates[k])[:, i], np.ones(win) / win, "same")
+                            for i in range(n_components)])
+        for k in keys
+    }
+
+    # unified limits (first 3 PCs)
+    allP = np.vstack([traj[k][:, :3] for k in keys])
+    # lims = [(allP[:, i].min(), allP[:, i].max()) for i in range(3)]
+
+    # colors
+    cmap = plt.get_cmap(cmap_name or ('tab20' if len(keys) > 10 else 'tab10'))
+    key_color = {k: cmap(i % cmap.N) for i, k in enumerate(keys)}
+
+    # grid (force one row if you want)
+    n = len(keys)
+    nrows, ncols = 1, n
+    fig = plt.figure(figsize=(4*ncols, 3.6))
+
+    t_rel = bins[:-1] - t_pre
+    onset_idx = int(np.argmin(np.abs(t_rel)))
+
+    axes = {}
+    for i, k in enumerate(keys, 1):
+        ax = fig.add_subplot(nrows, ncols, i, projection="3d")
+        P = traj[k][:, :3]
+        # t_rel = bins[:-1] - time_before_change
+        # onset_idx = int(np.argmin(np.abs(t_rel)))
+
+        # If absolute times available, build a single global Normalizer
+        abs_time_norm = None
+        abs_cmap = get_cmap(abs_time_cmap)
+        if show_trials and (per_key_trial_starts is not None):
+            # collect min/max across ALL trials, ALL keys
+            tmins, tmaxs = [], []
+            for j in keys:
+                starts = per_key_trial_starts.get(j, [])
+                if len(starts) == 0: 
+                    continue
+                tmins.append(np.min(np.asarray(starts) + t_rel[0]))
+                tmaxs.append(np.max(np.asarray(starts) + t_rel[-1]))
+            if tmins and tmaxs:
+                abs_time_norm = Normalize(vmin=float(np.min(tmins)), vmax=float(np.max(tmaxs)))
+        
+        # --- unified limits INCLUDING trials ---
+        pts_for_lims = [traj[k][:, :3] for k in keys]  # mean per key
+
+        # --- per-trial overlays: only a few, evenly spaced ---
+        if show_trials and (per_key_unit_trials is not None) and (k in per_key_unit_trials):
+            trials_list = per_key_unit_trials[k]
+            if max_trials_per_key is not None:
+                trials_list = trials_list[:max_trials_per_key]
+
+            if len(trials_list) > 0 and n_trial_overlays > 0:
+                n_show = min(n_trial_overlays, len(trials_list))
+                idxs = np.unique(np.linspace(0, len(trials_list)-1, n_show, dtype=int))
+
+                for idx in idxs:
+                    Rt = trials_list[idx]                      # (n_units, n_bins)
+                    Pt = ((Rt.T - mu) / sd) @ pca.components_.T
+                    if win > 1:
+                        Pt = np.column_stack([
+                            np.convolve(Pt[:, j], np.ones(win)/(win), "same")
+                            for j in range(n_components)
+                        ])
+
+                    # --- color by absolute time across session ---
+                    if abs_time_norm is not None and (per_key_trial_starts is not None):
+                        start_t = per_key_trial_starts[k][idx]  # absolute start (seconds)
+                        abs_times = start_t + t_rel             # length n_bins
+                        colors = abs_cmap(abs_time_norm(abs_times))
+
+                        # draw as colored segments
+                        segments = [list(zip(Pt[i:i+2,0], Pt[i:i+2,1], Pt[i:i+2,2]))
+                                    for i in range(Pt.shape[0]-1)]
+                        lc = Line3DCollection(segments, colors=colors[:-1],
+                                            linewidth=trial_lw, alpha=1.0)
+                        ax.add_collection3d(lc)
+                    else:
+                        # fallback: single-color line
+                        ax.plot(Pt[:, 0], Pt[:, 1], Pt[:, 2],
+                                lw=trial_lw, alpha=0.9, color=key_color[k], zorder=1)
+
+                    pts_for_lims.append(Pt[:, :3])
+
+        allP = np.vstack(pts_for_lims) if pts_for_lims else np.zeros((1,3))   
+        lims = [(allP[:, i].min(), allP[:, i].max()) for i in range(3)]
+ 
+        # mean trajectory
+        ax.plot(P[:, 0], P[:, 1], P[:, 2], lw=mean_lw, color='k' if per_key_trial_starts else key_color[k], alpha=0.95) #key_color[k],
+
+        # onset marker
+        ax.scatter(P[onset_idx, 0], P[onset_idx, 1], P[onset_idx, 2],
+                   s=28, edgecolor="k", facecolor="w", linewidth=0.6)
+
+        # axes & labels
+        ax.set_xlim(lims[0]); ax.set_ylim(lims[1]); ax.set_zlim(lims[2])
+        ax.set_title(str(k), fontsize=9)
+        ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); ax.set_zlabel("PC3")
+        axes[k] = ax
+
+    # sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=t_rel[0], vmax=t_rel[-1]))
+    # sm.set_array([])
+    # fig.colorbar(sm, ax=ax, fraction=0.02, pad=0.04, label="Time (s)")
+    
+    # before adding the colorbar
+    fig.tight_layout(rect=[0, 0.12, 1, 1])  # leave 12% at the bottom
+
+    # Shared colorbar for absolute time (if available)
+    if abs_time_norm is not None:
+        sm = plt.cm.ScalarMappable(cmap=abs_cmap, norm=abs_time_norm)
+        sm.set_array([])
+        # cbar = fig.colorbar(sm, ax=list(axes.values()),
+        #                     fraction=0.02, pad=0.04)
+        # cbar.set_label("Absolute time (s)")
+
+        fig.subplots_adjust(bottom=0.18)
+        cax = fig.add_axes([0.2, 0.10, 0.6, 0.03])
+        fig.colorbar(sm, cax=cax, orientation="horizontal").set_label("Absolute time (s)")
+
+
+    # fig.tight_layout()
+    return fig, axes
+
+def _pca_inputs_for(area_packet, grouping, *, bin_size=0.01):
+    spikes_all = area_packet["spikes"]
+    t_pre = grouping.get("t_pre", 0.25)
+    t_post = grouping.get("t_post", 0.5)
+    duration = t_pre + t_post
+    pop_concat, per_key_unit_rates, key_slices, keys, bins = build_image_locked_rates(
+        spikes_all, grouping["trials"], start_col=grouping["start_col"], duration=duration, bin_size=bin_size, time_before_change=t_pre
+    )
+    return pop_concat, per_key_unit_rates, keys, bins
+
+def plot_pca_trajs_grid(area_packets, groupings, *, bin_size=0.01,
+                        win=7, marginals=False):
+
+    # normalize input: dict{name->pkt} or list[pkt]
+    if isinstance(area_packets, dict):
+        items = list(area_packets.items())
+    else:
+        items = [(pkt.get("name", f"Area{i}"), pkt) for i, pkt in enumerate(area_packets)]
+
+    area_names = [n for n,_ in items]
+    group_labels = [g.get("label", "Group") for g in groupings]
+
+    R, C = len(items), len(groupings)
+    # fig, axes = plt.subplots(R, C, figsize=(4*C, 4*R), subplot_kw={"projection": "3d"})
+    R, C = max(1, len(items)), len(groupings)
+    fig, axes = plt.subplots(R, C, figsize=(4*C, 4*R), subplot_kw={"projection": "3d"})
+
+    axes = np.atleast_2d(axes)
+    handles = []
+    labels = []
+    for r, (area_name, pkt) in enumerate(items):
+        for c, g in enumerate(groupings):
+            ax = axes[r, c]
+            pop_concat, per_key_unit_rates, keys, bins = _pca_inputs_for(pkt, g, bin_size=bin_size)
+            title = group_labels[c] if r == 0 else None
+            _, ax = plot_pca_trajs_3d(pop_concat, per_key_unit_rates, keys, bins,
+                                     win=win, ncols=4, ax=ax, title=title, marginals=marginals)
+            handles, labels = ax.get_legend_handles_labels()
+            # Add legend only once per column (e.g. top row axis)
+            if r == 0:
+                ax.legend(handles, labels,
+                        frameon=False, fontsize=8, ncol=3,
+                        loc="upper center", bbox_to_anchor=(0.5, 1.25))
+        # row “suptitle”: put area name on the left
+        axes[r, 0].set_ylabel(area_name, rotation=0, labelpad=40, va="center", ha="center", fontsize=10)
+        
+        
+    fig.tight_layout()
+    return fig, axes
+
+
+def plot_pca_trajs_3d(pop_concat, per_key_unit_rates, keys, bins, *,
+                      win=7, ncols=4, ax=None, title=None, marginals=False):
+    """
+    Plot 3D PCA trajectories for per-key population rates.
+
+    pop_concat: (n_units, sum_k n_bins) concatenated mean-rate matrix (all keys)
+    per_key_unit_rates: dict key -> (n_units, n_bins) mean rates per key
+    keys: ordered list of keys to plot
+    bins: histogram edges used (unused here, kept for API symmetry)
+    win: smoothing window (moving average) over time bins
+    ncols: kept for API compatibility (unused here)
+    ax: optional existing 3D axis to draw into
+    title: optional title for this panel
+    marginals: if True, add small 2D projections (PC pairs) as insets
+    """
+  
+
+    # --- fit PCA globally on all time bins (samples=time, features=units) ---
+    X = pop_concat.T  # (time, units)
+    mu = X.mean(0)
+    sd = X.std(0) + 1e-9
+    Xz = (X - mu) / sd
+
+    n_samples, n_features = X.shape
+    n_eff = min(3, n_samples, n_features)  # <= available dims
+    if n_eff < 1:
+        raise ValueError(f"Not enough data for PCA (samples={n_samples}, units={n_features}).")
+    if n_eff < 3:
+        print(f"[warn] reducing n_components to {n_eff} (samples={n_samples}, units={n_features}).")
+
+
+    pca = PCA(n_components=3, random_state=0, svd_solver="full").fit(Xz)
+
+    def project_to_pcs(R):
+        # R: (n_units, n_bins) -> (n_bins, 3)
+        Z = ((R.T - mu) / sd) @ pca.components_.T
+        return Z
+
+    def smooth_traj(P, w):
+        if w <= 1:
+            return P
+        k = np.ones(int(w), dtype=float) / float(w)
+        return np.column_stack([np.convolve(P[:, i], k, mode="same") for i in range(P.shape[1])])
+
+    # --- figure/axes ---
+    created_fig = False
+    if ax is None:
+        fig = plt.figure(figsize=(4, 4))
+        ax = fig.add_subplot(111, projection="3d")
+        created_fig = True
+    else:
+        fig = ax.figure
+
+    # --- colors ---
+    cmap = plt.get_cmap("tab20")
+    key_colors = {k: cmap(i % cmap.N) for i, k in enumerate(keys)}
+
+    # --- plot each key's smoothed 3D trajectory ---
+    for k in keys:
+        R = per_key_unit_rates[k]            # (n_units, n_bins)
+        P3 = project_to_pcs(R)               # (n_bins, 3)
+        S3 = smooth_traj(P3, win)            # smoothed (n_bins, 3)
+        ax.plot(S3[:, 0], S3[:, 1], S3[:, 2], lw=1.0, alpha=0.95,
+         label=str(k), 
+        color=key_colors[k])
+
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_zlabel("PC3")
+    if title:
+        ax.set_title(title)
+
+    # --- optional tiny marginal projections ---
+    if marginals:
+        try:
+            from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+            ax12 = inset_axes(ax, width="34%", height="28%", loc="upper left", borderpad=0.6)
+            ax13 = inset_axes(ax, width="34%", height="28%", loc="upper right", borderpad=0.6)
+            ax23 = inset_axes(ax, width="34%", height="28%", loc="lower left", borderpad=0.6)
+
+            for k in keys:
+                R = per_key_unit_rates[k]
+                P3 = project_to_pcs(R)
+                S3 = smooth_traj(P3, win)
+                c = key_colors[k]
+                ax12.plot(S3[:, 0], S3[:, 1], lw=0.8, alpha=0.95, color=c)
+                ax13.plot(S3[:, 0], S3[:, 2], lw=0.8, alpha=0.95, color=c)
+                ax23.plot(S3[:, 1], S3[:, 2], lw=0.8, alpha=0.95, color=c)
+
+            for a in (ax12, ax13, ax23):
+                a.set_xticks([]); a.set_yticks([])
+                a.set_frame_on(True)
+        except Exception:
+            # keep it silent; main 3D plot still renders
+            pass
+
+    return (fig, ax) if created_fig else (None, ax)
+
+
+def pca_trajs_3d_for(
+    area_packet,
+    stim_df,
+    *,
+    key_col="image_name",
+    start_col="start_time",
+    label=None,
+    t_pre=0.25,
+    t_post=0.5,
+    bin_size=0.01,
+    duration=0.75,
+    smooth_kind="gaussian",
+    smooth_value=0.5,
+    win=7,
+    ncols=4
+):
+    """
+    One-stop shop: build grouping -> image-locked rates -> 3D PCA trajectories.
+    Returns (fig, axes) from plot_pca_trajs_3d().
+    """
+    grp = make_group(
+        stim_df,
+        key_col=key_col,
+        label=(label or key_col),
+        start_col=start_col,
+        t_pre=t_pre, t_post=t_post, bin_size=bin_size,
+        smooth_kind=smooth_kind, smooth_value=smooth_value,
+    )
+
+    pop_concat, per_key_unit_rates, key_slices, keys, bins = build_image_locked_rates(
+        area_packet["spikes"],
+        grp["trials"],                     # must have ['start_time','key']
+        duration=duration,
+        bin_size=bin_size,
+        time_before_change=t_pre
+    )
+
+    return plot_pca_trajs_3d(
+        pop_concat,
+        per_key_unit_rates,
+        keys,
+        bins,
+        win=win,
+        ncols=ncols
+    )
+
+
+
+def pca_trajs_3d_multi(areas_dict, stim_df, **kwargs):
+    """
+    areas_dict: {area_name: area_packet}
+    Returns: {area_name: (fig, axes)}
+    """
+    out = {}
+    for name, pkt in areas_dict.items():
+        fig, axes = pca_trajs_3d_for(pkt, stim_df, label=name, **kwargs)
+        out[name] = (fig, axes)
+    return out
+
+
+
+def plot_pca_trajs_for_area(area_packet, grouping, *, duration=0.75, bin_size=0.01, win=7, ncols=4):
+    """
+    grouping: an object returned by make_group(...) (your grp_image/grp_novelty/grp_outcome)
+              must expose grouping["trials"] with ['start_time','key'].
+    """
+    spikes_all = area_packet["spikes"]
+    t_pre = grouping.get("t_pre", 0.25)   # use whatever was set in make_group
+    pop_concat, per_key_unit_rates, key_slices, keys, bins = build_image_locked_rates(
+        spikes_all,
+        grouping["trials"],
+        start_col=grouping["start_col"],
+        duration=duration,
+        bin_size=bin_size,
+        time_before_change=t_pre
+    )
+    return plot_pca_trajs_3d(pop_concat, per_key_unit_rates, keys, bins, win=win, ncols=ncols)
+
+
+def pca_trajs_3d_multi(area_packets, groupings, **kwargs):
+    """
+    area_packets: dict{name->packet} OR list[packet] (expects pkt['name'])
+    groupings: list of your make_group(...) outputs (e.g., [grp_image, grp_novelty, grp_outcome])
+    Returns: dict{name -> dict{group_label -> (fig, axes)}}
+    """
+    if isinstance(area_packets, dict):
+        items = area_packets.items()
+    else:
+        items = ((pkt.get("name", "Area"), pkt) for pkt in area_packets)
+
+    out = {}
+    for area_name, pkt in items:
+        per_group = {}
+        for g in groupings:
+            label = g.get("label", "Group")
+            per_group[label] = plot_pca_trajs_for_area(pkt, g, **kwargs)
+        out[area_name] = per_group
+    return out
