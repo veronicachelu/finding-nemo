@@ -34,7 +34,7 @@ if __name__=="__main__":
     ecephys_session_table_final = behavior_utils.extract_relevant_session_info(cache, table_type='ecephys_strict', verbose=verbose)
 
     # For debugging: reduce table
-    ecephys_session_table_final = ecephys_session_table_final.iloc[:2]
+    # ecephys_session_table_final = ecephys_session_table_final.iloc[:2]
     # ecephys_session_table_final.head()
 
     if verbose:
