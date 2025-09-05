@@ -924,6 +924,7 @@ def plot_subpop_spikes(unit_spike_times, trials, colors, sep, mids, names,
 
     ax.axvline(0, color="k", ls="--", lw=1)
     ax.set_xlabel(x_label)
+    ax.set_ylabel('Firing rate (Hz)')
     # ax.set_xlabel("Time from stimulus (s)"); ax.set_ylabel("Spikes")
     # ax.legend()
     return ax
@@ -933,7 +934,7 @@ def plot_area_grid_combined(
     subplots=("raster", "mean±sd"),
     t_pre=0.5, t_post=1.0, bin_size=0.1,
     smooth_kind=None, smooth_value=None,
-    pick="first", seed=0, figsize_per_row=(4, 2.5), sharex=True,
+    pick="random", seed=0, figsize_per_row=(4, 2.5), sharex=True,
     extras=("autocorr",),                  
     acg_bin_ms=1.0, acg_win_ms=60.0,     
     acg_refractory_ms=2.0             
@@ -1026,7 +1027,7 @@ def plot_image_locked_matrix_old(pop_concat, keys, key_slices, cmap="viridis"):
     key_slices: dict mapping key -> slice into the concat axis
     """
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(6,4))
     im = ax.imshow(pop_concat, aspect="auto", cmap=cmap,
                    interpolation="nearest")
     bin_size = 0.01          # keep consistent with build_image_locked_rates
