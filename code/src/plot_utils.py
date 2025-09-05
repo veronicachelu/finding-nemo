@@ -12,6 +12,8 @@ import data_utils
 import importlib
 importlib.reload(data_utils)
 from data_utils import *
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
@@ -277,9 +279,8 @@ def plot_unit_raster_aligned(unit_spike_times,
 def plot_multi_area_psth_and_raster(
     area_packets,
     event_times,
-    stim_ids,
-    time_before_change=1.0,
-    duration=2.5,
+    t_pre=0.25,
+    t_post=0.5,
     bin_size=0.01,
     normalize='zscore',
     cmap='viridis',
@@ -299,6 +300,7 @@ def plot_multi_area_psth_and_raster(
     """
 
     # ---- binning for PSTH (0..duration) ----
+    duration = t_pre + t_post
     bins = np.arange(0, duration + bin_size, bin_size)
     n_areas = len(area_packets)
 
@@ -312,7 +314,7 @@ def plot_multi_area_psth_and_raster(
 
     results = []
     # event column index for heatmap (time=0 => bin ~ time_before_change)
-    event_col = int(np.argmin(np.abs(bins[:-1] - time_before_change)))
+    event_col = int(np.argmin(np.abs(bins[:-1] - t_pre)))
 
     for r, pkt in enumerate(area_packets):
         name       = pkt['name']
@@ -320,7 +322,7 @@ def plot_multi_area_psth_and_raster(
         ridx       = int(np.clip(pkt.get('raster_idx', 0), 0, max(0, len(spikes_all)-1)))
 
         # ---------- population PSTH using trial binning ----------
-        start_times = event_times - time_before_change  # align so x=0 is the event
+        start_times = event_times - t_pre  # align so x=0 is the event
         psths = []
         for st in spikes_all:
             trial_counts = get_binned_triggered_spike_counts_fast(st, start_times, bins)  # (trials, bins-1)
@@ -330,6 +332,28 @@ def plot_multi_area_psth_and_raster(
         
         # ---------- if specified, z-score individual unit firing rates ----------
         plt_rate_label = 'Firing rate (Hz)'
+        
+
+        def _normalize_rates(X, method='zscore', axis=1, eps=1e-9):
+            """
+            Normalize firing-rate matrix X (units x time) along `axis`.
+            method: 'zscore' | 'minmax' | 'none'
+            """
+            if method == 'none':
+                return X
+            X = np.asarray(X, float)
+            if method == 'zscore':
+                mu = X.mean(axis=axis, keepdims=True)
+                sd = X.std(axis=axis, keepdims=True) + eps
+                return (X - mu) / sd
+            elif method == 'minmax':
+                mn = X.min(axis=axis, keepdims=True)
+                mx = X.max(axis=axis, keepdims=True)
+                return (X - mn) / (mx - mn + eps)
+            else:
+                raise ValueError(f"unknown method: {method}")
+
+
         pop_rates = _normalize_rates(pop_rates, method=normalize, axis=1)
 
         # ---------- panels ----------
@@ -341,7 +365,7 @@ def plot_multi_area_psth_and_raster(
         # ticks in seconds relative to event (subtract pre)
         xticks = np.linspace(0, pop_rates.shape[1]-1, 6, dtype=int)
         ax_hm.set_xticks(xticks)
-        ax_hm.set_xticklabels(np.round(bins[:-1][xticks] - time_before_change, 2))
+        ax_hm.set_xticklabels(np.round(bins[:-1][xticks] - t_pre, 2))
         ax_hm.set_ylabel('Unit # (e.g., sorted by depth)')
         ax_hm.set_xlabel('Time from event (s)')
         ax_hm.axvline(event_col, color='r', linestyle='--', lw=1)
@@ -350,8 +374,16 @@ def plot_multi_area_psth_and_raster(
         cb.set_label(plt_rate_label)
 
         # Mean PSTH
-        ax_mean.plot(bins[:-1] - time_before_change, np.nanmean(pop_rates, axis=0), color='k',
-                     label=f'{name} (n={pop_rates.shape[0]})')
+        mean = np.nanmean(pop_rates, axis=0)
+        std = np.nanstd(pop_rates, axis=0)
+        time = bins[:-1] - t_pre
+
+        ax_mean.plot(time, mean, color='k',
+                    label=f'{name} (n={pop_rates.shape[0]})')
+        ax_mean.fill_between(time, mean - std, mean + std,
+                            color='k', alpha=0.2)  # transparent shading
+        # ax_mean.plot(bins[:-1] - t_pre, np.nanmean(pop_rates, axis=0), color='k',
+        #              label=f'{name} (n={pop_rates.shape[0]})')
         ax_mean.axvline(0, ls='--', color='r', lw=1)
         ax_mean.set_xlabel('Time from event (s)')
         ax_mean.set_ylabel(plt_rate_label)
@@ -359,7 +391,6 @@ def plot_multi_area_psth_and_raster(
         ax_mean.set_title('Mean PSTH', fontsize=10)
 
         # Raster (reuse helper)
-        t_pre, t_post = time_before_change, duration - time_before_change
         rtimes, rtrials = get_stim_window(spikes_all[ridx], event_times,
                                           pre_window=t_pre, post_window=t_post)
         create_raster(rtimes, rtrials, ax=ax_ras, size=2, color='black')
@@ -978,7 +1009,7 @@ def plot_autocorrelogram(st, *, bin_ms=1.0, win_ms=60.0, refractory_ms=2.0, ax=N
     lags_ms, counts = generate_autocorr_data(spk, bin_ms + 1, win_ms)
     if ax is None:
         _, ax = plt.subplots(1, 1, figsize=(4, 4))
-    ax.bar(lags_ms, counts, width=bin_ms, color='gray', linewidth=0.3)
+    ax.bar(lags_ms, counts, width=bin_ms, color='k', linewidth=0.3)
     ax.axvspan(-refractory_ms, refractory_ms, color='orange', alpha=0.2)
     ax.axvline(refractory_ms, color='black', linewidth=0.2)
     ax.axvline(-refractory_ms, color='black', linewidth=0.2)
@@ -1003,7 +1034,7 @@ def plot_image_locked_matrix_old(pop_concat, keys, key_slices, cmap="viridis"):
     onset_bin = 0#int(round(time_before_change / bin_size))
     # add color blocks or separators per image
     # give each key a color
-    cm = plt.get_cmap("tab20")
+    cm = plt.get_cmap("tab10")
     for i, k in enumerate(keys):
         sl = key_slices[k]
         color = cm(i % cm.N)
@@ -1037,8 +1068,8 @@ def plot_image_locked_matrix_old(pop_concat, keys, key_slices, cmap="viridis"):
 
 def plot_image_locked_matrix(
     pop_concat, keys, key_slices, *,
-    bin_size=0.01, time_before_change=0.25,
-    cmap="viridis", block_cmap="tab20",
+    bin_size=0.01, time_before_change=0.25, title="name",
+    cmap="viridis", block_cmap="tab10",
     figsize=(12, 6), annotate=True, draw_onset=True
 ):
     fig, ax = plt.subplots(figsize=figsize)
@@ -1057,6 +1088,7 @@ def plot_image_locked_matrix(
 
     fig.colorbar(im, ax=ax, label="Firing rate (Hz)")
     ax.set(xlabel=f"Concatenated bins (bin={bin_size}s)", ylabel="Unit index")
+    fig.suptitle(title)
     fig.tight_layout()
     return fig, ax
 
@@ -1091,9 +1123,11 @@ def plot_pca_trajs_3d_multi(areas, groups, start_cols,
                             trial_lw=0.7, mean_lw=2.2,
                             max_trials_per_key=None,
                             n_trial_overlays=4,
+                            downsample_step=5,
                             per_key_trial_starts=None,
                             abs_time_cmap="viridis"):
     figs = {}
+    mean_val_dict_per_area = {}
     for area, spikes_all in areas.items():
         trials = groups[area]
         start_col = start_cols[area]
@@ -1108,23 +1142,27 @@ def plot_pca_trajs_3d_multi(areas, groups, start_cols,
             t_pre=t_pre, t_post=t_post, bin_size=0.01
         )
 
-        fig, axes = plot_pca_trajs_3d_flat(
+        fig, axes, mean_val_dict = plot_pca_trajs_3d_flat(
             pop_concat, per_key_unit_rates, keys, bins,
-            n_components=n_components, win=win, ncols=ncols,
-            
+            n_components=n_components, win=win, ncols=ncols,  
             random_state=random_state, cmap_name=cmap_name,
             per_key_unit_trials=per_key_unit_trials,
             show_trials=show_trials, trial_alpha=trial_alpha,
             trial_lw=trial_lw, mean_lw=mean_lw,
             max_trials_per_key=max_trials_per_key,
-            n_trial_overlays=n_trial_overlays,               # <— forward
+            n_trial_overlays=n_trial_overlays,     downsample_step=downsample_step,          # <— forward
             per_key_trial_starts=per_key_trial_starts.get(area, {}) if per_key_trial_starts else None,
             abs_time_cmap=abs_time_cmap                      # <— forward
         )
 
+        for k in mean_val_dict.keys():
+            if k not in mean_val_dict_per_area.keys():
+                mean_val_dict_per_area[k] = []
+            mean_val_dict_per_area[k].append(mean_val_dict[k])
+
         fig.suptitle(area, fontsize=12)
         figs[area] = (fig, axes)
-    return figs
+    return figs, mean_val_dict_per_area
 
 def plot_pca_trajs_3d_multi_old(areas, groups, start_cols, *, 
     n_components=3, win=7, time_before_change=0.25, ncols=4, random_state=0, cmap_name=None,
@@ -1249,7 +1287,7 @@ def plot_pca_trajs_3d_multi_old(areas, groups, start_cols, *,
 #     fig.tight_layout()
 #     return fig, axes
 
-def plot_pca_trajs_3d_flat(pop_concat, per_key_unit_rates, keys, bins,
+def plot_pca_trajs_3d_flat_without_insets(pop_concat, per_key_unit_rates, keys, bins,
                       *, n_components=3, win=7, ncols=4,
                       t_pre=0.25, t_post=0.75, random_state=0, cmap_name=None,
                       per_key_unit_trials=None, show_trials=True,
@@ -1278,7 +1316,7 @@ def plot_pca_trajs_3d_flat(pop_concat, per_key_unit_rates, keys, bins,
     # lims = [(allP[:, i].min(), allP[:, i].max()) for i in range(3)]
 
     # colors
-    cmap = plt.get_cmap(cmap_name or ('tab20' if len(keys) > 10 else 'tab10'))
+    cmap = plt.get_cmap(cmap_name or ('tab10' if len(keys) > 10 else 'tab10'))
     key_color = {k: cmap(i % cmap.N) for i, k in enumerate(keys)}
 
     # grid (force one row if you want)
@@ -1322,10 +1360,15 @@ def plot_pca_trajs_3d_flat(pop_concat, per_key_unit_rates, keys, bins,
 
             if len(trials_list) > 0 and n_trial_overlays > 0:
                 n_show = min(n_trial_overlays, len(trials_list))
-                idxs = np.unique(np.linspace(0, len(trials_list)-1, n_show, dtype=int))
+                # idxs = np.unique(np.linspace(0, len(trials_list)-1, n_show, dtype=int))
 
-                for idx in idxs:
-                    Rt = trials_list[idx]                      # (n_units, n_bins)
+                quarters = [q for q in np.array_split(np.arange(len(trials_list)), n_trial_overlays) if len(q) > 0]
+                for qidx in quarters:
+                    # CHANGED: average trials within this quarter (n_trials_q, n_units, n_bins) -> (n_units, n_bins)
+                    Rt = np.mean(np.stack([trials_list[i] for i in qidx], axis=0), axis=0)
+
+                # for idx in idxs:
+                    # Rt = trials_list[idx]                      # (n_units, n_bins)
                     Pt = ((Rt.T - mu) / sd) @ pca.components_.T
                     if win > 1:
                         Pt = np.column_stack([
@@ -1333,20 +1376,34 @@ def plot_pca_trajs_3d_flat(pop_concat, per_key_unit_rates, keys, bins,
                             for j in range(n_components)
                         ])
 
-                    # --- color by absolute time across session ---
-                    if abs_time_norm is not None and (per_key_trial_starts is not None):
-                        start_t = per_key_trial_starts[k][idx]  # absolute start (seconds)
-                        abs_times = start_t + t_rel             # length n_bins
+                    # # --- color by absolute time across session ---
+                    # if abs_time_norm is not None and (per_key_trial_starts is not None):
+                    #     start_t = per_key_trial_starts[k][idx]  # absolute start (seconds)
+                    #     abs_times = start_t + t_rel             # length n_bins
+                    #     colors = abs_cmap(abs_time_norm(abs_times))
+
+                    #     # draw as colored segments
+                    #     segments = [list(zip(Pt[i:i+2,0], Pt[i:i+2,1], Pt[i:i+2,2]))
+                    #                 for i in range(Pt.shape[0]-1)]
+                    #     lc = Line3DCollection(segments, colors=colors[:-1],
+                    #                         linewidth=trial_lw, alpha=1.0)
+                    #     ax.add_collection3d(lc)
+                    # else:
+                    #     # fallback: single-color line
+                    #     ax.plot(Pt[:, 0], Pt[:, 1], Pt[:, 2],
+                    #             lw=trial_lw, alpha=0.9, color=key_color[k], zorder=1)
+                    # CHANGED: color by mean absolute start time of the quarter (if available)
+                    if (abs_time_norm is not None) and (per_key_trial_starts is not None):
+                        mean_start = float(np.mean(per_key_trial_starts[k][qidx]))
+                        abs_times = mean_start + t_rel
                         colors = abs_cmap(abs_time_norm(abs_times))
 
-                        # draw as colored segments
-                        segments = [list(zip(Pt[i:i+2,0], Pt[i:i+2,1], Pt[i:i+2,2]))
-                                    for i in range(Pt.shape[0]-1)]
+                        segments = [list(zip(Pt[i:i+2, 0], Pt[i:i+2, 1], Pt[i:i+2, 2]))
+                                    for i in range(Pt.shape[0] - 1)]
                         lc = Line3DCollection(segments, colors=colors[:-1],
                                             linewidth=trial_lw, alpha=1.0)
                         ax.add_collection3d(lc)
                     else:
-                        # fallback: single-color line
                         ax.plot(Pt[:, 0], Pt[:, 1], Pt[:, 2],
                                 lw=trial_lw, alpha=0.9, color=key_color[k], zorder=1)
 
@@ -1391,20 +1448,301 @@ def plot_pca_trajs_3d_flat(pop_concat, per_key_unit_rates, keys, bins,
     # fig.tight_layout()
     return fig, axes
 
+
+def plot_pca_trajs_3d_flat(pop_concat, per_key_unit_rates, keys, bins,
+                      *, n_components=3, win=7, ncols=4, downsample_step=5,
+                      t_pre=0.25, t_post=0.75, random_state=0, cmap_name=None,
+                      per_key_unit_trials=None, show_trials=True,
+                      trial_alpha=0.35, trial_lw=0.7, mean_lw=2.2,
+                      n_trial_overlays=4, max_trials_per_key=None,
+                      per_key_trial_starts=None,        # NEW: dict key -> list[float secs]
+                      abs_time_cmap="viridis"):          # NEW
+
+    # --- global PCA on timebins x units ---
+    X = pop_concat.T
+    mu, sd = X.mean(0), X.std(0) + 1e-9
+    pca = PCA(n_components=n_components, random_state=random_state).fit((X - mu) / sd)
+
+    def project(R):  # (n_units, n_bins) -> (n_bins, n_components)
+        return ((R.T - mu) / sd) @ pca.components_.T
+
+    # --- ADD near the top (after defining `project`) ---
+    quarter_trajs = {}   # NEW: (key, quarter_idx) -> Ptd (n_out x n_components)
+
+    # --- smooth (and optionally resample) per-key trajectories ---
+    traj = {}
+    onset_idx_ds_dict = {}
+    t_rel = bins[:-1] - t_pre
+    onset_idx = int(np.argmin(np.abs(t_rel)))
+
+    for k in keys:
+        Pk = project(per_key_unit_rates[k])[:, :n_components]
+        dt = float(np.median(np.diff(bins)))    # seconds per sample
+        Pks = smooth_traj(Pk, win, dt=dt, cut_hz=3., order=2)
+        n_out = max(3, len(Pks)//downsample_step)
+        Pkd = _resample_by_arclength(Pks, n_out)
+        keep_idx = np.linspace(0, len(Pks)-1, n_out).astype(int)  # for onset mapping
+        j = int(np.argmin(np.abs(keep_idx - onset_idx)))  # position in S3d
+        onset_idx_ds = np.clip(j, 0, len(Pkd)-1)
+
+        traj[k] = Pkd
+        onset_idx_ds_dict[k] = onset_idx_ds
+
+    # unified limits (first 3 PCs)
+    allP = np.vstack([traj[k][:, :3] for k in keys])
+    # lims = [(allP[:, i].min(), allP[:, i].max()) for i in range(3)]
+
+    # colors
+    cmap = plt.get_cmap(cmap_name or ('tab10' if len(keys) > 10 else 'tab10'))
+    key_color = {k: cmap(i % cmap.N) for i, k in enumerate(keys)}
+
+    # grid (force one row if you want)
+    n = len(keys)
+    # nrows, ncols = 1, n
+    nrows, ncols = 2, n                        
+    fig = plt.figure(figsize=(4*ncols, 6))
+    gs = fig.add_gridspec(nrows, ncols, height_ratios=[3, 2])
+
+
+    axes = {}
+    mean_val_dict = {}
+    for i, k in enumerate(keys, 1):
+        # ax = fig.add_subplot(nrows, ncols, i, projection="3d")
+        ax = fig.add_subplot(gs[0, i-1], projection="3d")  # NEW: first row cell
+
+        P = traj[k][:, :3]
+        onset_idx_ds = onset_idx_ds_dict[k]
+        # t_rel = bins[:-1] - time_before_change
+        # onset_idx = int(np.argmin(np.abs(t_rel)))
+
+        # If absolute times available, build a single global Normalizer
+        abs_time_norm = None
+        abs_cmap = get_cmap(abs_time_cmap)
+        if show_trials and (per_key_trial_starts is not None):
+            # collect min/max across ALL trials, ALL keys
+            tmins, tmaxs = [], []
+            for j in keys:
+                starts = per_key_trial_starts.get(j, [])
+                if len(starts) == 0: 
+                    continue
+                tmins.append(np.min(np.asarray(starts) + t_rel[0]))
+                tmaxs.append(np.max(np.asarray(starts) + t_rel[-1]))
+            if tmins and tmaxs:
+                abs_time_norm = Normalize(vmin=float(np.min(tmins)), vmax=float(np.max(tmaxs)))
+        
+        # --- unified limits INCLUDING trials ---
+        pts_for_lims = [traj[k][:, :3] for k in keys]  # mean per key
+
+        # --- per-trial overlays: only a few, evenly spaced ---
+        if show_trials and (per_key_unit_trials is not None) and (k in per_key_unit_trials):
+            trials_list = per_key_unit_trials[k]
+            if max_trials_per_key is not None:
+                trials_list = trials_list[:max_trials_per_key]
+
+            if len(trials_list) > 0 and n_trial_overlays > 0:
+                n_show = min(n_trial_overlays, len(trials_list))
+                # idxs = np.unique(np.linspace(0, len(trials_list)-1, n_show, dtype=int))
+
+                # quarters = [q for q in np.array_split(np.arange(len(trials_list)), n_trial_overlays) if len(q) > 0]
+                quarters = [q for q in np.array_split(np.arange(len(trials_list)), n_trial_overlays) if len(q) > 0]
+                for qnum, qidx in enumerate(quarters):        
+                    # CHANGED: average trials within this quarter (n_trials_q, n_units, n_bins) -> (n_units, n_bins)
+                    Rt = np.mean(np.stack([trials_list[i] for i in qidx], axis=0), axis=0)
+                    
+                    Pt = ((Rt.T - mu) / sd) @ pca.components_.T
+                    dt = float(np.median(np.diff(bins)))    # seconds per sample
+                    Pts = smooth_traj(Pt, win, dt=dt, cut_hz=3., order=3)
+                    n_out = max(3, len(Pt)//downsample_step)
+                    Ptd = _resample_by_arclength(Pts, n_out)
+                    quarter_trajs[(k, qnum)] = Ptd[:, :n_components]
+
+                    keep_idx = np.linspace(0, len(Pts)-1, n_out).astype(int)  # for onset mapping
+                    j = int(np.argmin(np.abs(keep_idx - onset_idx)))  # position in S3d
+                    onset_idx_ds = np.clip(j, 0, len(Ptd)-1)
+
+                    # if win > 1:
+                    #     Pt = np.column_stack([
+                    #         np.convolve(Pt[:, j], np.ones(win)/(win), "same")
+                    #         for j in range(n_components)
+                    #     ])
+
+                   
+                    if (abs_time_norm is not None) and (per_key_trial_starts is not None):
+                        mean_start = float(np.mean(per_key_trial_starts[k][qidx]))
+                        abs_times = mean_start + t_rel
+                        colors = abs_cmap(abs_time_norm(abs_times))
+
+                        segments = [list(zip(Ptd[i:i+2, 0], Ptd[i:i+2, 1], Ptd[i:i+2, 2]))
+                                    for i in range(Ptd.shape[0] - 1)]
+                        lc = Line3DCollection(segments, colors=colors[:-1],
+                                            linewidth=trial_lw, alpha=1.0)
+                        ax.add_collection3d(lc)
+                         # onset marker
+                        ax.scatter(Ptd[onset_idx_ds, 0], Ptd[onset_idx_ds, 1], Ptd[onset_idx_ds, 2],
+                                s=20, edgecolor=colors[-1], facecolor=colors[-1], linewidth=0.6)
+
+                        ax.scatter(Ptd[-1, 0], Ptd[-1, 1], Ptd[-1, 2],
+                            s=50, color=colors[-1], edgecolor=colors[-1], zorder=5, marker='*')
+
+                    else:
+                        ax.plot(Ptd[:, 0], Ptd[:, 1], Ptd[:, 2],
+                                lw=trial_lw, alpha=0.9, color=key_color[k], zorder=1)
+
+                    pts_for_lims.append(Ptd[:, :3])
+                    
+        allP = np.vstack(pts_for_lims) if pts_for_lims else np.zeros((1,3))   
+        lims = [(allP[:, i].min(), allP[:, i].max()) for i in range(3)]
+ 
+        # mean trajectory
+        ax.plot(P[:, 0], P[:, 1], P[:, 2], lw=mean_lw, color='k' if per_key_trial_starts else key_color[k], alpha=0.95) #key_color[k],
+
+        
+        # onset marker
+        ax.scatter(P[onset_idx_ds, 0], P[onset_idx_ds, 1], P[onset_idx_ds, 2],
+                   s=20, edgecolor='k', facecolor='k', linewidth=0.6)
+
+        ax.scatter(P[-1, 0], P[-1, 1], P[-1, 2],
+                        s=50, color='k', edgecolor='k', zorder=5, marker='*')
+
+        # axes & labels
+        ax.set_xlim(lims[0]); ax.set_ylim(lims[1]); ax.set_zlim(lims[2])
+        ax.set_title(str(k), fontsize=9)
+        ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); ax.set_zlabel("PC3")
+        axes[k] = ax
+        # add vertical colorbar next to this subplot
+        sm = plt.cm.ScalarMappable(cmap=abs_cmap, norm=abs_time_norm)
+        #     sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, orientation='vertical', shrink=0.5, pad=0.2)
+        cbar.set_label("time")
+
+        # --- RSA over quarter-averaged trajectories; plots on second row ---
+        q_trajs = [quarter_trajs[(k, q)] for q in range(n_trial_overlays) if (k, q) in quarter_trajs]
+        if len(q_trajs) >= 2:
+            X = np.vstack([P.reshape(-1) for P in q_trajs])
+            X = (X - X.mean(0, keepdims=True)) / (X.std(0, keepdims=True) + 1e-9)
+            # rdm = 1.0 - np.corrcoef(X)
+            from sklearn.metrics.pairwise import cosine_similarity
+
+            rdm = cosine_similarity(X)   # (n_cond x n_cond), values ∈ [−1, 1]
+            # rdm = 1.0 - sim              # cosine distance
+
+            # ax_rdm = fig.add_subplot(gs[1, i-1])
+            # im = ax_rdm.imshow(rdm, interpolation='nearest')
+            # ax_rdm.set_title("Q1–Q{} RDM".format(len(q_trajs)), fontsize=8)
+            # ticks = np.arange(len(q_trajs))
+            # labels = [f"Q{j+1}" for j in ticks]
+            # ax_rdm.set_xticks(ticks); ax_rdm.set_yticks(ticks)
+            # ax_rdm.set_xticklabels(labels, rotation=0, fontsize=7)
+            # ax_rdm.set_yticklabels(labels, fontsize=7)
+
+             # --- replace this whole times-block ---
+            # times = []
+            # all_starts = per_key_trial_starts.get(k, [])
+            # t0, t1 = t_rel[0], t_rel[-1]
+            # mean_start = float(np.mean(per_key_trial_starts[k][qidx]))
+            # times = mean_start + t_rel
+            # q_bounds = np.linspace(t0, t1, n_trial_overlays+1)
+            # times = [f"{0.5*(q_bounds[j]+q_bounds[j+1]):.2f}" 
+            #         for j in range(len(q_bounds)-1)]
+            
+            ticks = np.arange(len(q_trajs))
+            labels = [f"trial_grp_{j+1}" for j in ticks]
+
+            ax_rdm = fig.add_subplot(gs[1, i-1])
+            im = ax_rdm.imshow(rdm, interpolation='nearest', cmap="RdBu_r")  # use same cmap
+
+            # mean of off-diagonal entries
+            vals = rdm[np.triu_indices_from(rdm, k=1)]
+            mean_val = np.mean(vals) if len(vals) > 0 else np.nan
+
+
+            ax_rdm.set_title(f"RSA", fontsize=8)
+            ticks = np.arange(len(q_trajs))
+            ax_rdm.set_xticks(ticks); ax_rdm.set_yticks(ticks)
+            ax_rdm.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+            ax_rdm.set_yticklabels(labels, fontsize=7)
+
+            # add colorbar
+            cbar = fig.colorbar(im, ax=ax_rdm, orientation='vertical', fraction=0.05, pad=0.02)
+            cbar.set_label("1 - r", fontsize=7)
+            cbar.ax.tick_params(labelsize=6)
+
+            mean_val_dict[k] = mean_val
+
+            # # NEW: add a 1-column subplot on the right of the RDM row
+            # ax_mean = ax_rdm.inset_axes([1.5, 0.1, 0.2, 0.8])  # x,y,w,h in axes fraction
+            # ax_mean.bar([0], [mean_val], color="gray")
+            # ax_mean.set_ylim(0, 2)          # since 1 - r ranges [0,2]
+            # ax_mean.set_xticks([])
+            # ax_mean.set_ylabel("Mean RSA", fontsize=7)
+            # ax_mean.set_title("Avg", fontsize=7)
+    
+    # if quarter_trajs:
+    #     labels = []
+    #     X = []
+    #     for (k, qnum), Ptd in sorted(quarter_trajs.items(), key=lambda x: (str(x[0][0]), x[0][1])):
+    #         labels.append(f"{k}:Q{qnum+1}")
+    #         X.append(Ptd.reshape(-1))
+    #     X = np.vstack(X)  # (n_conditions, T*C)
+    #     X = (X - X.mean(0, keepdims=True)) / (X.std(0, keepdims=True) + 1e-9)  # z-score features
+    #     sim = np.corrcoef(X)            # similarity
+    #     rdm = 1.0 - sim                 # dissimilarity (RDM)
+
+    #     ax_rdm = fig.add_subplot(gs[1, :])  # NEW: span full second row
+    #     im = ax_rdm.imshow(rdm, interpolation='nearest')
+    #     ax_rdm.set_title("Quarter-trajectory RSA (1 - r)")
+    #     # ax_rdm.set_xticks(np.arange(len(labels)))
+    #     # ax_rdm.set_yticks(np.arange(len(labels)))
+    #     # ax_rdm.set_xticklabels(labels, rotation=60, ha='right', fontsize=7)
+    #     # ax_rdm.set_yticklabels(labels, fontsize=7)
+    #     ax_rdm.set_xticks([])
+    #     ax_rdm.set_yticks([])
+    #     # optional: add compact labels below plot
+    #     ax_rdm.set_xlabel("Conditions (key × quarter)")
+    #     ax_rdm.set_ylabel("Conditions (key × quarter)") 
+    #     # fig.colorbar(im, ax=ax_rdm, orientation='vertical', fraction=0.02, pad=0.02)
+    #     # --- tweak the colorbar ---
+    #     fig.colorbar(im, ax=ax_rdm, orientation='vertical', fraction=0.015, pad=0.01, label="1 - r")
+
+
+    # sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=t_rel[0], vmax=t_rel[-1]))
+    # sm.set_array([])
+    # fig.colorbar(sm, ax=ax, fraction=0.02, pad=0.04, label="Time (s)")
+    
+    # before adding the colorbar
+    fig.tight_layout()#rect=[0, 0.12, 1, 1])  # leave 12% at the bottom
+
+    # Shared colorbar for absolute time (if available)
+    # if abs_time_norm is not None:
+    #     sm = plt.cm.ScalarMappable(cmap=abs_cmap, norm=abs_time_norm)
+    #     sm.set_array([])
+    #     # cbar = fig.colorbar(sm, ax=list(axes.values()),
+    #     #                     fraction=0.02, pad=0.04)
+    #     # cbar.set_label("Absolute time (s)")
+
+    #     fig.subplots_adjust(bottom=0.18)
+    #     cax = fig.add_axes([0.2, 0.10, 0.6, 0.03])
+    #     fig.colorbar(sm, cax=cax, orientation="horizontal").set_label("Absolute time (s)")
+
+
+    # fig.tight_layout()
+    return fig, axes, mean_val_dict
+
 def _pca_inputs_for(area_packet, grouping, *, bin_size=0.01):
     spikes_all = area_packet["spikes"]
     t_pre = grouping.get("t_pre", 0.25)
     t_post = grouping.get("t_post", 0.5)
     duration = t_pre + t_post
     pop_concat, per_key_unit_rates, key_slices, keys, bins = build_image_locked_rates(
-        spikes_all, grouping["trials"], start_col=grouping["start_col"], duration=duration, bin_size=bin_size, time_before_change=t_pre
+        spikes_all, grouping["trials"], start_col=grouping["start_col"],  bin_size=bin_size,
+         t_pre=t_pre, t_post=t_post
     )
     return pop_concat, per_key_unit_rates, keys, bins
 
-def plot_pca_trajs_grid(area_packets, groupings, *, bin_size=0.01,
+def plot_pca_trajs_grid(area_packets, groupings, *, bin_size=0.01,  downsample_step=5,
                         win=7, marginals=False):
 
-    # normalize input: dict{name->pkt} or list[pkt]
+
     if isinstance(area_packets, dict):
         items = list(area_packets.items())
     else:
@@ -1425,24 +1763,70 @@ def plot_pca_trajs_grid(area_packets, groupings, *, bin_size=0.01,
         for c, g in enumerate(groupings):
             ax = axes[r, c]
             pop_concat, per_key_unit_rates, keys, bins = _pca_inputs_for(pkt, g, bin_size=bin_size)
-            title = group_labels[c] if r == 0 else None
-            _, ax = plot_pca_trajs_3d(pop_concat, per_key_unit_rates, keys, bins,
-                                     win=win, ncols=4, ax=ax, title=title, marginals=marginals)
+            title = group_labels[c] #if r == 0 else None
+            t_pre = g.get("t_pre", 0.25)
+            t_post = g.get("t_post", 0.5)
+            _, ax = plot_pca_trajs_3d(pop_concat, per_key_unit_rates, keys, bins, t_pre=t_pre,
+                                     win=win, ncols=4, ax=ax, title=title, 
+                                     downsample_step=downsample_step,
+                                     marginals=marginals)
             handles, labels = ax.get_legend_handles_labels()
             # Add legend only once per column (e.g. top row axis)
             if r == 0:
                 ax.legend(handles, labels,
                         frameon=False, fontsize=8, ncol=3,
                         loc="upper center", bbox_to_anchor=(0.5, 1.25))
-        # row “suptitle”: put area name on the left
-        axes[r, 0].set_ylabel(area_name, rotation=0, labelpad=40, va="center", ha="center", fontsize=10)
         
-        
-    fig.tight_layout()
+        axes[r,0].annotate(area_name, xy=(-0.1, 0.5), xycoords='axes fraction',
+                       ha='right', va='center', rotation=90,
+                       annotation_clip=False, fontsize=15)  
+       
+    fig.tight_layout(h_pad=2.0, w_pad=2.)
+    
     return fig, axes
 
+def _downsample_rows(X, *, target_points=None, step=None):
+    n = X.shape[0]
+    if step is None:
+        step = max(1, int(np.ceil(n / max(1, target_points))))
+    idx = np.arange(0, n, step)
+    return X[idx], idx
 
-def plot_pca_trajs_3d(pop_concat, per_key_unit_rates, keys, bins, *,
+def _downsample_rows_mean(X, *, step):
+    chunks = np.array_split(X, int(np.ceil(X.shape[0]/step)), axis=0)
+    Xd = np.vstack([c.mean(axis=0) for c in chunks])
+    keep_idx = (np.rint(np.linspace(0, X.shape[0]-1, len(chunks)))).astype(int)
+    return Xd, keep_idx
+
+from scipy.signal import butter, filtfilt
+
+def smooth_traj(P, w, *, dt=None, cut_hz=4.0, order=3):
+    """
+    Zero-phase low-pass per PC. If dt is given, uses cut_hz; else
+    falls back to a boxcar of width w (for safety).
+    """
+    if dt is None:
+        if w <= 1: 
+            return P
+        k = np.ones(int(w), dtype=float) / float(w)
+        return np.column_stack([np.convolve(P[:, i], k, mode="same")
+                                for i in range(P.shape[1])])
+
+    nyq = 0.5 / dt
+    b, a = butter(order, cut_hz / nyq, btype="low")
+    Q = P.copy()
+    for i in range(Q.shape[1]):
+        Q[:, i] = filtfilt(b, a, Q[:, i], padtype="odd")
+    return Q
+
+def _resample_by_arclength(P, n_out):
+    d = np.linalg.norm(np.diff(P, axis=0), axis=1)
+    s = np.r_[0, np.cumsum(d)]
+    s_new = np.linspace(0, s[-1], n_out)
+    return np.column_stack([np.interp(s_new, s, P[:, j]) for j in range(P.shape[1])])
+
+
+def plot_pca_trajs_3d(pop_concat, per_key_unit_rates, keys, bins, *, t_pre=0.25, downsample_step=5,
                       win=7, ncols=4, ax=None, title=None, marginals=False):
     """
     Plot 3D PCA trajectories for per-key population rates.
@@ -1472,20 +1856,13 @@ def plot_pca_trajs_3d(pop_concat, per_key_unit_rates, keys, bins, *,
     if n_eff < 3:
         print(f"[warn] reducing n_components to {n_eff} (samples={n_samples}, units={n_features}).")
 
-
     pca = PCA(n_components=3, random_state=0, svd_solver="full").fit(Xz)
 
     def project_to_pcs(R):
         # R: (n_units, n_bins) -> (n_bins, 3)
         Z = ((R.T - mu) / sd) @ pca.components_.T
         return Z
-
-    def smooth_traj(P, w):
-        if w <= 1:
-            return P
-        k = np.ones(int(w), dtype=float) / float(w)
-        return np.column_stack([np.convolve(P[:, i], k, mode="same") for i in range(P.shape[1])])
-
+    
     # --- figure/axes ---
     created_fig = False
     if ax is None:
@@ -1496,18 +1873,53 @@ def plot_pca_trajs_3d(pop_concat, per_key_unit_rates, keys, bins, *,
         fig = ax.figure
 
     # --- colors ---
-    cmap = plt.get_cmap("tab20")
+    cmap = plt.get_cmap("tab10")
     key_colors = {k: cmap(i % cmap.N) for i, k in enumerate(keys)}
+
+    # relative time bins
+    t_rel = bins[:-1] - t_pre
+    onset_idx = int(np.argmin(np.abs(t_rel)))  # nearest bin to event onset
+
 
     # --- plot each key's smoothed 3D trajectory ---
     for k in keys:
         R = per_key_unit_rates[k]            # (n_units, n_bins)
         P3 = project_to_pcs(R)               # (n_bins, 3)
-        S3 = smooth_traj(P3, win)            # smoothed (n_bins, 3)
-        ax.plot(S3[:, 0], S3[:, 1], S3[:, 2], lw=1.0, alpha=0.95,
-         label=str(k), 
-        color=key_colors[k])
+        # S3 = smooth_traj(P3, win)            # smoothed (n_bins, 3)
+        dt = float(np.median(np.diff(bins)))    # seconds per sample
+        S3 = smooth_traj(P3, win, dt=dt, cut_hz=3.0, order=3)
 
+        # downsample
+        # S3d, keep_idx = _downsample_rows(S3, step=downsample_step)
+        n_out = max(3, len(S3)//downsample_step)
+        S3d = _resample_by_arclength(S3, n_out)
+        keep_idx = np.linspace(0, len(P3)-1, n_out).astype(int)  # for onset mapping
+        
+        ax.plot(S3d[:, 0], S3d[:, 1], S3d[:, 2], lw=1.0, alpha=0.95,
+         label=str(k), color=key_colors[k])
+        # mark the event onset with a scatter point
+
+        # where does the onset land after decimation? closest kept index:
+        # onset_idx_ds = np.argmin(np.abs(keep_idx - onset_idx))
+        j = int(np.argmin(np.abs(keep_idx - onset_idx)))  # position in S3d
+        onset_idx_ds = np.clip(j, 0, len(S3d)-1)
+
+        # ax.plot(S3d[:, 0], S3d[:, 1], S3d[:, 2],
+        #         lw=1.0, alpha=0.95, color=key_colors[k], label=str(k))
+
+        ax.scatter(S3d[onset_idx_ds, 0], S3d[onset_idx_ds, 1], S3d[onset_idx_ds, 2],
+                s=20, color=key_colors[k], edgecolor=key_colors[k], zorder=5)
+
+        
+        # --- add arrow at the end ---
+        # pick last two points
+        x0, y0, z0 = S3d[-2]
+        x1, y1, z1 = S3d[-1]
+
+        ax.scatter(S3d[-1, 0], S3d[-1, 1], S3d[-1, 2],
+                s=50, color=key_colors[k], edgecolor=key_colors[k], zorder=5, marker='*')
+
+       
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
     ax.set_zlabel("PC3")
@@ -1518,18 +1930,61 @@ def plot_pca_trajs_3d(pop_concat, per_key_unit_rates, keys, bins, *,
     if marginals:
         try:
             from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-            ax12 = inset_axes(ax, width="34%", height="28%", loc="upper left", borderpad=0.6)
-            ax13 = inset_axes(ax, width="34%", height="28%", loc="upper right", borderpad=0.6)
-            ax23 = inset_axes(ax, width="34%", height="28%", loc="lower left", borderpad=0.6)
+            ax12 = inset_axes(ax, width="32%", height="26%", loc="upper left", borderpad=0.6)
+            ax13 = inset_axes(ax, width="32%", height="26%", loc="upper right", borderpad=0.6)
+            ax23 = inset_axes(ax, width="32%", height="26%", loc="lower left", borderpad=0.6)
+
+            ax12.set_xlabel("PC1")
+            ax12.set_ylabel("PC2")
+            ax13.set_xlabel("PC1")
+            ax13.set_ylabel("PC3")
+            ax23.set_xlabel("PC2")
+            ax23.set_ylabel("PC3")
 
             for k in keys:
                 R = per_key_unit_rates[k]
                 P3 = project_to_pcs(R)
-                S3 = smooth_traj(P3, win)
+                dt = float(np.median(np.diff(bins)))    # seconds per sample
+                S3 = smooth_traj(P3, win, dt=dt, cut_hz=3.0, order=3)
+                # S3 = smooth_traj(P3, win)
+                # downsample
+                # S3d, keep_idx = _downsample_rows_mean(S3, step=downsample_step)
+                n_out = max(3, len(S3)//downsample_step)
+                S3d = _resample_by_arclength(S3, n_out)
+                keep_idx = np.linspace(0, len(P3)-1, n_out).astype(int)  # for onset mapping
+
+                j = int(np.argmin(np.abs(keep_idx - onset_idx)))  # position in S3d
+                onset_idx_ds = np.clip(j, 0, len(S3d)-1)
+
                 c = key_colors[k]
-                ax12.plot(S3[:, 0], S3[:, 1], lw=0.8, alpha=0.95, color=c)
-                ax13.plot(S3[:, 0], S3[:, 2], lw=0.8, alpha=0.95, color=c)
-                ax23.plot(S3[:, 1], S3[:, 2], lw=0.8, alpha=0.95, color=c)
+                ax12.plot(S3d[:, 0], S3d[:, 1], lw=0.8, alpha=0.95, color=c)
+                ax13.plot(S3d[:, 0], S3d[:, 2], lw=0.8, alpha=0.95, color=c)
+                ax23.plot(S3d[:, 1], S3d[:, 2], lw=0.8, alpha=0.95, color=c)
+                # onset markers (2D projections of the same event point)
+                ax12.scatter(S3d[onset_idx_ds, 0], S3d[onset_idx_ds, 1], s=20, color=c, edgecolor=c, zorder=5)
+                ax13.scatter(S3d[onset_idx_ds, 0], S3d[onset_idx_ds, 2], s=20, color=c, edgecolor=c, zorder=5)
+                ax23.scatter(S3d[onset_idx_ds, 1], S3d[onset_idx_ds, 2], s=20, color=c, edgecolor=c, zorder=5)
+
+                ax12.scatter(S3d[-1, 0], S3d[-1, 1], s=30, color=c, edgecolor=c, zorder=5, marker='*')
+                ax13.scatter(S3d[-1, 0], S3d[-1, 2], s=30, color=c, edgecolor=c, zorder=5, marker='*')
+                ax23.scatter(S3d[-1, 1], S3d[-1, 2], s=30, color=c, edgecolor=c, zorder=5, marker='*')
+
+                # Arrow at the last segment
+                # ax12.annotate("",
+                #     xy=(S3d[-1, 0], S3d[-1, 1]),      # arrow head (last point)
+                #     xytext=(S3d[-2, 0], S3d[-2, 1]),  # arrow tail (prev point)
+                #     arrowprops=dict(arrowstyle="-|>", color=c, alpha=0.95,lw=1.5, zorder=5)
+                # )
+                # ax13.annotate("",
+                #     xy=(S3d[-1, 0], S3d[-1, 2]),      # arrow head (last point)
+                #     xytext=(S3d[-2, 0], S3d[-2, 2]),  # arrow tail (prev point)
+                #     arrowprops=dict(arrowstyle="-|>", color=c, alpha=0.95,lw=1.5, zorder=5)
+                # )
+                # ax23.annotate("",
+                #     xy=(S3d[-1, 1], S3d[-1, 2]),      # arrow head (last point)
+                #     xytext=(S3d[-2, 1], S3d[-2, 2]),  # arrow tail (prev point)
+                #     arrowprops=dict(arrowstyle="-|>", color=c, alpha=0.95,lw=1.5, zorder=5)
+                # )
 
             for a in (ax12, ax13, ax23):
                 a.set_xticks([]); a.set_yticks([])
@@ -1573,9 +2028,9 @@ def pca_trajs_3d_for(
     pop_concat, per_key_unit_rates, key_slices, keys, bins = build_image_locked_rates(
         area_packet["spikes"],
         grp["trials"],                     # must have ['start_time','key']
-        duration=duration,
+        t_pre=t_pre,
         bin_size=bin_size,
-        time_before_change=t_pre
+        t_post=t_post
     )
 
     return plot_pca_trajs_3d(
@@ -1639,3 +2094,128 @@ def pca_trajs_3d_multi(area_packets, groupings, **kwargs):
             per_group[label] = plot_pca_trajs_for_area(pkt, g, **kwargs)
         out[area_name] = per_group
     return out
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+def _fit_pca(pop_concat, n_components=3, random_state=0):
+    """Fit PCA on (units x all_timebins) matrix and return (pca, mu, sd)."""
+    X = pop_concat.T                                # (timebins, units)
+    mu = X.mean(0); sd = X.std(0) + 1e-9
+    pca = PCA(n_components=n_components, svd_solver="full", random_state=random_state).fit((X - mu) / sd)
+    return pca, mu, sd
+
+def _project(unit_by_time, pca, mu, sd):
+    """Project (units x n_bins) onto previously fit PCs → (n_bins x n_pc)."""
+    return ((unit_by_time.T - mu) / sd) @ pca.components_.T
+
+def _smooth(M, win=None):
+    """Moving-average smooth along time for each column of (T x D)."""
+    if not win or win <= 1: return M
+    k = np.ones(win) / win
+    return np.column_stack([np.convolve(M[:,i], k, mode="same") for i in range(M.shape[1])])
+
+def plot_pc_timeseries_by_key(pop_concat, per_key_unit_rates, keys, bins, *,
+                              n_components=3, time_before_change=0.25,
+                              win=None, sharey=True, figsize=(5, 2.6)):
+    """
+    Fit PCA on pop_concat, then plot PC1–3 time series per key.
+    Returns (fig, axes_dict) where axes_dict[key] = Axes.
+    """
+    pca, mu, sd = _fit_pca(pop_concat, n_components=n_components)
+    t_rel = bins[:-1] - float(time_before_change)
+
+    n = len(keys)
+    fig, axes = plt.subplots(n, 1, figsize=(figsize[0], figsize[1]*n),
+                             sharex=True, sharey=sharey)
+    if n == 1: axes = [axes]
+
+    axes_dict = {}
+    for ax, k in zip(axes, keys):
+        R = per_key_unit_rates[k]                # (n_units, n_bins)
+        pcs = _smooth(_project(R, pca, mu, sd), win=win)  # (n_bins, n_pc)
+        for i, lab, lw in [(0,"PC1",1.5),(1,"PC2",1.2),(2,"PC3",1.0)]:
+            if i >= pcs.shape[1]: break
+            ax.plot(t_rel, pcs[:, i], lw=lw, label=lab)
+        ax.axvline(0, color='k', lw=0.8, alpha=0.6)
+        ax.set_title(str(k))
+        axes_dict[k] = ax
+
+    axes[-1].set_xlabel("Time from onset (s)")
+    for a in axes: a.set_ylabel("PC score")
+    axes[0].legend(frameon=False, fontsize=8, ncol=3)
+    fig.tight_layout()
+    return fig, axes_dict
+
+def plot_pc_timeseries_by_key_multi(area_data, *,
+                                    n_components=3, time_before_change=0.25,
+                                    win=None, ncols=4, sharey=True, figsize=(5, 2.6)):
+    """
+    area_data: dict[area] -> dict with keys:
+        'pop_concat', 'per_key_unit_rates', 'keys', 'bins'
+    Returns dict[area] -> (fig, axes_dict)
+    """
+    figs = {}
+    for area, D in area_data.items():
+        fig, axes_dict = plot_pc_timeseries_by_key(
+            D['pop_concat'], D['per_key_unit_rates'], D['keys'], D['bins'],
+            n_components=n_components, time_before_change=time_before_change,
+            win=win, sharey=sharey, figsize=figsize
+        )
+        fig.suptitle(area)
+        figs[area] = (fig, axes_dict)
+    return figs
+
+def plot_pc_timeseries_grid(area_data, *,
+                            n_components=3, time_before_change=0.25,
+                            win=None, figsize=(12, 8)):
+    areas = list(area_data.keys())
+    n_rows = len(areas)
+    n_cols = len(next(iter(area_data.values()))['keys'])
+
+    # fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize,
+    #                          sharex=True, sharey=True, squeeze=False)
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(n_cols * 3, n_rows * 2.0),  # <-- scale dynamically
+        sharex=False, sharey=False, squeeze=False
+    )
+
+
+    for r, area in enumerate(areas):
+        D = area_data[area]
+        pca, mu, sd = _fit_pca(D['pop_concat'], n_components=n_components)
+        t_rel = D['bins'][:-1] - float(time_before_change)
+
+        for c, k in enumerate(D['keys']):
+            ax = axes[r, c]
+            R = D['per_key_unit_rates'][k]
+            pcs = _smooth(_project(R, pca, mu, sd), win=win)
+            for i, lab, lw in [(0,"PC1",1.5),(1,"PC2",1.2),(2,"PC3",1.0)]:
+                if i >= pcs.shape[1]: break
+                ax.plot(t_rel, pcs[:, i], lw=lw, label=lab)
+            ax.axvline(0, color='k', lw=0.8, alpha=0.6)
+            ax.legend(frameon=False, fontsize=6, ncol=1, loc="upper left",
+                 bbox_to_anchor=(1.01, 1.0))
+            # if r == 0: 
+            ax.set_title(str(k))
+            axes[r,c].set_ylabel(f"{area}\nPC score")
+            axes[r,c].set_xlabel(f"Time from onset (s)")
+
+    # axes[-1, :].flat[-1].legend(frameon=False, fontsize=8, ncol=3)
+    # fig.supxlabel("Time from onset (s)")
+    # grab handles/labels from any Axes (e.g. first one)
+
+    
+    # handles, labels = axes[0,0].get_legend_handles_labels()
+
+    # fig.legend(
+    #     handles, labels,
+    #     loc="upper center",       # or "lower center", "center right", etc.
+    #     bbox_to_anchor=(0.5, -0.02),   # (x, y) in figure coords
+    #     ncol=3, frameon=False, fontsize=8
+    # )
+    fig.tight_layout()
+    return fig, axes
